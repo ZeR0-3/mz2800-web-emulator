@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: GPL-2.0-only
+     Copyright (C) 2026 ZeR0-3
+     This file is part of the MZ-2800 Web Emulator, free software under the GNU GPL version 2 (see LICENSE). -->
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MZ-2800 Web Emulator (CSP / WebAssembly)</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: dark; --bg:#14161a; --panel:#1d2026; --line:#2c313a; --fg:#e6e8eb; --dim:#8b93a1; --acc:#5aa9ff; --ok:#4cc38a; --warn:#e5a84b; --bad:#e5604b; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 system-ui,-apple-system,"Hiragino Sans","Yu Gothic UI",sans-serif; }
+  header { padding:12px 20px; border-bottom:1px solid var(--line); display:flex; align-items:baseline; gap:12px; flex-wrap:wrap; }
+  header h1 { margin:0; font-size:17px; font-weight:600; }
+  header span { color:var(--dim); font-size:12px; }
+  main { display:grid; grid-template-columns:minmax(0,1fr) 340px; gap:16px; padding:16px 20px; max-width:1280px; margin:0 auto; }
+  @media (max-width: 960px) { main { grid-template-columns:1fr; } }
+  #stage { background:#000; border:1px solid var(--line); border-radius:6px; position:relative; aspect-ratio:640/480; width:100%; display:flex; align-items:center; justify-content:center; overflow:hidden; outline:none; }
+  #stage:focus-within, #stage.active { border-color:var(--acc); box-shadow:0 0 0 1px var(--acc); }
+  canvas { width:100%; height:100%; image-rendering:pixelated; image-rendering:crisp-edges; background:#000; display:block; }
+  #overlay { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:10px; background:rgba(0,0,0,.72); text-align:center; padding:20px; }
+  #overlay.hidden { display:none; }
+  #overlay p { margin:0; color:var(--dim); max-width:460px; }
+  #overlay .big { color:var(--fg); font-size:16px; }
+  #bar { display:flex; gap:14px; align-items:center; margin-top:8px; color:var(--dim); font-size:12px; flex-wrap:wrap; }
+  .led { display:inline-block; width:9px; height:9px; border-radius:50%; background:#3a3f48; margin-right:4px; vertical-align:middle; }
+  .led.on { background:var(--warn); box-shadow:0 0 6px var(--warn); }
+  section { background:var(--panel); border:1px solid var(--line); border-radius:6px; padding:12px 14px; margin-bottom:12px; }
+  section h2 { margin:0 0 8px; font-size:12px; letter-spacing:.06em; text-transform:uppercase; color:var(--dim); font-weight:600; }
+  .row { display:flex; align-items:center; gap:8px; margin:6px 0; }
+  .row label.name { width:82px; flex:none; color:var(--dim); }
+  .row .state { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:12px; }
+  #st-ipl,#st-kanji,#st-dict { white-space:normal; }
+  .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+  button, .btn { background:#2a2f38; color:var(--fg); border:1px solid #3a404b; border-radius:5px; padding:5px 11px; font:inherit; cursor:pointer; }
+  button:hover, .btn:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); border-color:var(--acc); color:#06121f; font-weight:600; }
+  button:disabled { opacity:.45; cursor:default; }
+  input[type=file] { display:none; }
+  input[type=text] { background:#12151a; color:var(--fg); border:1px solid #3a404b; border-radius:5px; padding:5px 8px; font:inherit; width:100%; }
+  input[type=range] { width:100%; }
+  .btns { display:flex; gap:6px; flex-wrap:wrap; }
+  small { color:var(--dim); }
+  #drop { border:1px dashed #3a404b; border-radius:6px; padding:10px; text-align:center; color:var(--dim); font-size:12px; }
+  #drop.over { border-color:var(--acc); color:var(--fg); }
+  footer { max-width:1280px; margin:0 auto; padding:4px 20px 28px; color:var(--dim); font-size:12px; }
+  footer a { color:var(--acc); }
+  kbd { background:#2a2f38; border:1px solid #3a404b; border-radius:3px; padding:0 4px; font-size:11px; }
+
+  #softkbBtn { margin-left:auto; }
+  #softkb { display:none; margin-top:8px; padding:6px; background:var(--panel); border:1px solid var(--line); border-radius:6px; user-select:none; -webkit-user-select:none; touch-action:none; }
+  #softkb.show { display:block; }
+  #softkb .kr { display:flex; gap:3px; margin-bottom:3px; }
+  #softkb .k { flex:var(--w,2) 1 0; min-width:0; height:40px; padding:0; display:flex; align-items:center; justify-content:center; font-size:13px; border-radius:5px; background:#2a2f38; border:1px solid #3a404b; color:var(--fg); -webkit-tap-highlight-color:transparent; touch-action:none; }
+  #softkb .k.sp { background:#232831; color:var(--dim); }
+  #softkb .k.down { background:var(--acc); color:#06121f; border-color:var(--acc); }
+  #softkb .k.latch { background:var(--warn); color:#1a1200; border-color:var(--warn); }
+  #softkb .gap { flex:var(--w,1) 1 0; }
+  @media (max-width:600px) { #softkb .k { height:34px; font-size:11px; } #softkb { padding:4px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>MZ-2800 Web Emulator</h1>
+  <span>Common Source Code Project (武田 利也 氏 / K.Ohta 氏) の MZ-2800 を WebAssembly 化</span>
+</header>
+<main>
+  <div>
+    <div id="stage" tabindex="0">
+      <canvas id="screen" width="640" height="400"></canvas>
+      <div id="overlay">
+        <div class="big" id="ovTitle">ROMなしでも起動できます</div>
+        <p id="ovText">右の「ROM」に <b>IPL.ROM</b> と <b>KANJI.ROM</b> を選ぶか、このページへドラッグ&ドロップしてください。ROMはこのブラウザの中にだけ保存され、どこにも送信されません。</p>
+        <div class="btns"><button class="primary" id="ovStart" disabled>電源ON</button></div>
+      </div>
+    </div>
+    <div id="bar">
+      <span><span class="led" id="ledFd"></span>FD</span>
+      <span><span class="led" id="ledHd"></span>HD</span>
+      <span id="speed">--</span>
+      <span id="focusState">画面をクリックするとキー入力が有効になります</span>
+      <button id="softkbBtn" type="button">⌨ ソフトキーボード</button>
+    </div>
+    <div id="softkb" aria-label="ソフトウェアキーボード"></div>
+  </div>
+
+  <aside>
+    <section>
+      <h2>ROM(各自で用意・省略可)</h2>
+      <div class="row"><label class="name">IPL.ROM</label><span class="state" id="st-ipl"></span><label class="btn" for="f-ipl">選択</label><input id="f-ipl" type="file"></div>
+      <div class="row"><label class="name">KANJI.ROM</label><span class="state" id="st-kanji"></span><label class="btn" for="f-kanji">選択</label><input id="f-kanji" type="file"></div>
+      <div class="row"><label class="name">DICT.ROM</label><span class="state" id="st-dict"></span><label class="btn" for="f-dict">選択</label><input id="f-dict" type="file"></div>
+      <div class="row"><small>DICT.ROM は任意(辞書ROM)。選んだROMはこのブラウザの IndexedDB に保存されます。IPL.ROM を選ばない場合は<b>内蔵の疑似IPL</b>で起動します(FD/HDDからのブートとFreeDOS-MZ2800向けの最小BIOS。漢字・カナ表示や、実機BIOSの機能を前提にするソフトは動きません)。</small></div>
+      <div class="btns"><button id="clearRoms">保存したROMを消す</button></div>
+    </section>
+
+    <section>
+      <h2>ディスク</h2>
+      <div class="row"><label class="name">FD0</label><span class="state" id="st-fd0">空</span><label class="btn" for="f-fd0">選択</label><input id="f-fd0" type="file"><button id="e-fd0" title="取り出し">⏏</button></div>
+      <div class="row"><label class="name">FD1</label><span class="state" id="st-fd1">空</span><label class="btn" for="f-fd1">選択</label><input id="f-fd1" type="file"><button id="e-fd1" title="取り出し">⏏</button></div>
+      <div class="row"><label class="name">HD0</label><span class="state" id="st-hd0">空</span><label class="btn" for="f-hd0">選択</label><input id="f-hd0" type="file"><button id="e-hd0" title="取り外し">⏏</button></div>
+      <div class="row"><small>FD: D88/D77/HDM など。HD: SASI の生イメージ(.dat)。HDDを変えたら電源ON/リセットしてください。</small></div>
+      <div class="btns">
+        <button id="sampleFd">FreeDOS FD を挿入</button>
+        <button id="sampleFdEms">FreeDOS FD(EMS付き)</button>
+        <button id="sampleHd">FreeDOS HDD を接続</button>
+      </div>
+      <div class="btns" style="margin-top:6px">
+        <button id="dl-fd0">FD0 を保存</button>
+        <button id="dl-hd0">HD0 を保存</button>
+      </div>
+      <div class="row"><label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="persistOn">ディスクの変更をこのブラウザに自動保存</label></div>
+      <div class="row"><small id="persistState"></small></div>
+      <div class="btns"><button id="clearDisks">保存したディスクを消す</button></div>
+      <div class="row"><small>自動保存はこのブラウザの中だけです(ブラウザのデータを消すと失われます)。確実に残すには「保存」でダウンロードしてください。</small></div>
+    </section>
+
+    <section>
+      <h2>操作</h2>
+      <div class="btns">
+        <button id="btnReset">リセット</button>
+        <button id="btnPause">一時停止</button>
+        <button id="btnFull">全画面</button>
+        <button id="btnMouse">マウス取り込み</button>
+        <button id="btnShot">画面保存</button>
+      </div>
+      <div class="row" style="margin-top:10px"><label class="name">速度</label>
+        <select id="speedSel" style="flex:1;background:#12151a;color:var(--fg);border:1px solid #3a404b;border-radius:5px;padding:5px 8px;font:inherit">
+          <option value="1">×1(実機の速さ・音あり)</option><option value="2">×2(音なし)</option><option value="4">×4(音なし)</option><option value="8">×8(音なし)</option><option value="16">×16(音なし)</option>
+        </select></div>
+      <div class="row"><label class="name">音量</label><input type="range" id="vol" min="0" max="100" value="70"><button id="btnMute">🔊</button></div>
+      <div class="row"><input type="text" id="typeText" placeholder="文字列を入力して Enter で送信(オートキー)"></div>
+      <div class="row"><small>キー配列は日本語(JIS)キーボードの物理位置に対応。<kbd>半角/全角</kbd>=かな漢字, <kbd>変換</kbd>/<kbd>無変換</kbd>, <kbd>PageUp/Down</kbd>=F13/F14。</small></div>
+    </section>
+
+    <section>
+      <div id="drop">ここにファイルをドロップ(ROM・ディスクイメージを自動判別)</div>
+    </section>
+  </aside>
+</main>
+<footer>
+  GPL-2.0-or-later。ソース・パッチ・ビルド手順は同梱の README を参照。ROM と、ROMを逆アセンブルした内容は同梱・再配布されていません。
+</footer>
+<script src="csp2800.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

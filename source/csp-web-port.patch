@@ -1,0 +1,2436 @@
+diff --git a/common.cpp b/common.cpp
+index 62f9930..3ae8f33 100644
+--- a/common.cpp
++++ b/common.cpp
+@@ -35,6 +35,10 @@
+ 	#define _USE_MATH_DEFINES
+ #endif
+ #include <math.h>
++#if defined(_USE_SDL)
++#include <unistd.h>
++#include <sys/stat.h>
++#endif
+ #include "common.h"
+ #include "fileio.h"
+ 
+@@ -1291,6 +1295,9 @@ const _TCHAR *DLL_PREFIX get_application_path()
+ 		} else {
+ 			my_tcscpy_s(app_path, _MAX_PATH, _T(".\\"));
+ 		}
++#elif defined(_USE_SDL)
++		// Web port: everything lives in Emscripten's in-memory file system
++		my_tcscpy_s(app_path, _MAX_PATH, _T("/"));
+ #else
+ #if defined(Q_OS_WIN)
+ 		std::string delim = "\\";
+diff --git a/emu.cpp b/emu.cpp
+index e312b32..a131940 100644
+--- a/emu.cpp
++++ b/emu.cpp
+@@ -50,7 +50,7 @@ EMU::EMU(class Ui_MainWindow *hwnd, GLDrawClass *hinst, std::shared_ptr<CSP_Logg
+ #elif defined(OSD_WIN32)
+ EMU::EMU(HWND hwnd, HINSTANCE hinst) : EMU_TEMPLATE(hwnd, hinst)
+ #else
+-EMU::EMU() : EMU()
++EMU::EMU() : EMU_TEMPLATE()
+ #endif
+ {
+ 	message_count = 0;
+@@ -118,6 +118,8 @@ EMU::EMU() : EMU()
+ 	osd = new OSD();
+ 	osd->main_window_handle = hwnd;
+ 	osd->instance_handle = hinst;
++#elif defined(OSD_SDL)
++	osd = new OSD();
+ #endif
+ 	int presented_rate, presented_samples;
+ 	osd->initialize(sound_rate, sound_samples, &presented_rate, &presented_samples);
+diff --git a/emu_template.h b/emu_template.h
+index 6603c48..c5f8891 100644
+--- a/emu_template.h
++++ b/emu_template.h
+@@ -47,6 +47,8 @@ class USING_FLAGS;
+ class GLDrawClass;
+ class EmuThreadClass;
+ class DrawThreadClass;
++#elif defined(OSD_SDL)
++#include "sdl/osd.h"
+ #else
+ class OSD;
+ #endif
+diff --git a/fileio.cpp b/fileio.cpp
+index 702d4e2..1e9e3f0 100644
+--- a/fileio.cpp
++++ b/fileio.cpp
+@@ -24,6 +24,11 @@
+ #elif defined(_WIN32)
+ 	#include <windows.h>
+ #endif
++#if defined(_USE_SDL)
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#endif
+ #include "fileio.h"
+ 
+ #ifdef USE_ZLIB
+diff --git a/sdl/osd.h b/sdl/osd.h
+new file mode 100644
+index 0000000..37c447f
+--- /dev/null
++++ b/sdl/osd.h
+@@ -0,0 +1,341 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++   Copyright (C) 2026 ZeR0-3
++   This file is part of the MZ-2800 Web Emulator, free software under the GNU GPL version 2 (see LICENSE). */
++/*
++	Web (Emscripten) port of CSP — OSD layer.
++
++	Replaces the Qt/Win32 OSD with a minimal one that talks to JavaScript through
++	plain exported C functions (see sdl/web_main.cpp).
++	GPL, same as Common Source Code Project.
++*/
++#ifndef _WEB_OSD_H_
++#define _WEB_OSD_H_
++
++#include <stdint.h>
++#include <string.h>
++#include <stdio.h>
++#include <string>
++#include <map>
++#include <vector>
++#include <memory>
++
++#include "../common.h"
++#include "../config.h"
++#include "../vm/vm.h"
++
++// ---- Windows virtual key codes (the VM keyboards are written against these) ----
++#ifndef VK_LBUTTON
++#define VK_BACK 0x08
++#define VK_TAB 0x09
++#define VK_CLEAR 0x0C
++#define VK_RETURN 0x0D
++#define VK_SHIFT 0x10
++#define VK_CONTROL 0x11
++#define VK_MENU 0x12
++#define VK_PAUSE 0x13
++#define VK_CAPITAL 0x14
++#define VK_KANA 0x15
++#define VK_KANJI 0x19
++#define VK_ESCAPE 0x1B
++#define VK_CONVERT 0x1C
++#define VK_NONCONVERT 0x1D
++#define VK_SPACE 0x20
++#define VK_PRIOR 0x21
++#define VK_NEXT 0x22
++#define VK_END 0x23
++#define VK_HOME 0x24
++#define VK_LEFT 0x25
++#define VK_UP 0x26
++#define VK_RIGHT 0x27
++#define VK_DOWN 0x28
++#define VK_INSERT 0x2D
++#define VK_DELETE 0x2E
++#define VK_HELP 0x2F
++#define VK_NUMPAD0 0x60
++#define VK_NUMPAD1 0x61
++#define VK_NUMPAD2 0x62
++#define VK_NUMPAD3 0x63
++#define VK_NUMPAD4 0x64
++#define VK_NUMPAD5 0x65
++#define VK_NUMPAD6 0x66
++#define VK_NUMPAD7 0x67
++#define VK_NUMPAD8 0x68
++#define VK_NUMPAD9 0x69
++#define VK_MULTIPLY 0x6A
++#define VK_ADD 0x6B
++#define VK_SEPARATOR 0x6C
++#define VK_SUBTRACT 0x6D
++#define VK_DECIMAL 0x6E
++#define VK_DIVIDE 0x6F
++#define VK_F1 0x70
++#define VK_F2 0x71
++#define VK_F3 0x72
++#define VK_F4 0x73
++#define VK_F5 0x74
++#define VK_F6 0x75
++#define VK_F7 0x76
++#define VK_F8 0x77
++#define VK_F9 0x78
++#define VK_F10 0x79
++#define VK_F11 0x7A
++#define VK_F12 0x7B
++#define VK_NUMLOCK 0x90
++#define VK_SCROLL 0x91
++#define VK_LSHIFT 0xA0
++#define VK_RSHIFT 0xA1
++#define VK_LCONTROL 0xA2
++#define VK_RCONTROL 0xA3
++#define VK_LMENU 0xA4
++#define VK_RMENU 0xA5
++#define VK_OEM_1 0xBA
++#define VK_OEM_PLUS 0xBB
++#define VK_OEM_COMMA 0xBC
++#define VK_OEM_MINUS 0xBD
++#define VK_OEM_PERIOD 0xBE
++#define VK_OEM_2 0xBF
++#define VK_OEM_3 0xC0
++#define VK_OEM_4 0xDB
++#define VK_OEM_5 0xDC
++#define VK_OEM_6 0xDD
++#define VK_OEM_7 0xDE
++#define VK_OEM_102 0xE2
++#define VK_LBUTTON 0x01
++#endif
++
++#define KEY_KEEP_FRAMES_WEB 3
++
++// printer drawing surfaces: the web port has no printer output, so these are inert placeholders
++typedef struct bitmap_s {
++	int width, height; scrntype_t *lpBuf;
++	scrntype_t *get_buffer(int y) { return lpBuf ? lpBuf + (size_t)y * width : (scrntype_t *)0; }
++} bitmap_t;
++typedef struct font_s {
++	_TCHAR family[64];
++	int width, height, rotate;
++	bool bold, italic;
++	bool initialized() { return false; }
++} font_t;
++typedef struct pen_s { int width; uint8_t r, g, b; } pen_t;
++
++class FIFO;
++class FILEIO;
++class CSP_Logger;
++
++class OSD_BASE {
++public:
++	VM_TEMPLATE *vm;
++	bool __USE_AUTO_KEY;
++	bool now_auto_key;
++	int host_cpus;
++	void *main_window_handle;
++	void *instance_handle;
++	void *p_glv;
++
++	OSD_BASE();
++	virtual ~OSD_BASE() {}
++
++	// ---- feature table (VM #defines exposed at run time) ----
++	void add_feature(const _TCHAR *key, double value);
++	void add_feature(const _TCHAR *key, int64_t value);
++	void add_feature(const _TCHAR *key, uint64_t value);
++	void add_feature(const _TCHAR *key, float value) { add_feature(key, (double)value); }
++	void add_feature(const _TCHAR *key, int value) { add_feature(key, (int64_t)value); }
++	void add_feature(const _TCHAR *key, int16_t value) { add_feature(key, (int64_t)value); }
++	void add_feature(const _TCHAR *key, int8_t value) { add_feature(key, (int64_t)value); }
++	void add_feature(const _TCHAR *key, uint32_t value) { add_feature(key, (uint64_t)value); }
++	void add_feature(const _TCHAR *key, uint16_t value) { add_feature(key, (uint64_t)value); }
++	void add_feature(const _TCHAR *key, uint8_t value) { add_feature(key, (uint64_t)value); }
++	bool check_feature(const _TCHAR *key);
++	double get_feature_double_value(const _TCHAR *key);
++	int64_t get_feature_int64_value(const _TCHAR *key);
++	int get_feature_int_value(const _TCHAR *key) { return (int)get_feature_int64_value(key); }
++	int32_t get_feature_int32_value(const _TCHAR *key) { return (int32_t)get_feature_int64_value(key); }
++	int16_t get_feature_int16_value(const _TCHAR *key) { return (int16_t)get_feature_int64_value(key); }
++	int8_t get_feature_int8_value(const _TCHAR *key) { return (int8_t)get_feature_int64_value(key); }
++	uint64_t get_feature_uint64_value(const _TCHAR *key);
++	uint32_t get_feature_uint32_value(const _TCHAR *key) { return (uint32_t)get_feature_uint64_value(key); }
++	uint16_t get_feature_uint16_value(const _TCHAR *key) { return (uint16_t)get_feature_uint64_value(key); }
++	uint8_t get_feature_uint8_value(const _TCHAR *key) { return (uint8_t)get_feature_uint64_value(key); }
++	void set_features();
++	void set_features_machine();
++	void set_features_cpu();
++	void set_features_vm();
++	void set_features_misc();
++	void set_features_debug();
++
++	// ---- logging (silent) ----
++	void debug_log(int level, const char *fmt, ...) {}
++	void debug_log(int level, int domain, const char *fmt, ...) {}
++	void debug_log(int level, int domain, char *buf) {}
++	void sound_debug_log(const char *fmt, ...) {}
++	std::shared_ptr<CSP_Logger> get_logger() { return std::shared_ptr<CSP_Logger>(); }
++
++	// ---- vm nodes (debugger names) ----
++	void reset_vm_node() {}
++	void set_vm_node(int id, const _TCHAR *name) {}
++	const _TCHAR *get_vm_node_name(int id) { return NULL; }
++	int get_vm_node_size() { return 0; }
++
++	// ---- misc ----
++	void lock_vm() {}
++	void unlock_vm() {}
++	void force_unlock_vm() {}
++	bool is_vm_locked() { return false; }
++	void sleep(uint32_t ms) {}
++	void vm_has_set() {}
++	void update_keyname_table() {}
++	void sync_some_devices() {}
++	void set_parent_thread(void *) {}
++	void set_draw_thread(void *) {}
++	void *get_parent_handler() { return NULL; }
++	void initialize(int rate, int samples, int *presented_rate, int *presented_samples);
++	void release();
++	void suspend() {}
++	void restore() {}
++	void power_off() {}
++	void notify_power_off() {}
++	void string_message_from_emu(EMU_MEDIA_TYPE::type_t, int, EMU_MESSAGE_TYPE::type_t, _TCHAR *) {}
++	void int_message_from_emu(EMU_MEDIA_TYPE::type_t, int, EMU_MESSAGE_TYPE::type_t, int64_t) {}
++
++	// ---- screen ----
++	int vm_screen_width, vm_screen_height;
++	int vm_window_width, vm_window_height, vm_window_width_aspect, vm_window_height_aspect;
++	std::vector<scrntype_t> screen_pixels;     // vm_screen_width * vm_screen_height
++	void set_vm_screen_size(int screen_width, int screen_height, int window_width, int window_height, int window_width_aspect, int window_height_aspect);
++	void set_vm_screen_lines(int lines) {}
++	scrntype_t *get_vm_screen_buffer(int y);
++	void reset_screen_buffer() {}
++	int get_vm_window_width() { return vm_window_width; }
++	int get_vm_window_height() { return vm_window_height; }
++	int get_vm_window_width_aspect() { return vm_window_width_aspect; }
++	int get_vm_window_height_aspect() { return vm_window_height_aspect; }
++	double get_window_mode_power(int mode) { return 1.0; }
++	int get_window_mode_width(int mode) { return vm_window_width; }
++	int get_window_mode_height(int mode) { return vm_window_height; }
++	void set_host_window_size(int, int, bool) {}
++	int draw_screen();
++	bool screen_skip_line;
++	void reload_bitmap() {}
++	void invalidate_screen() {}
++	void update_screen(void *) {}
++	void capture_screen() {}
++	void get_video_buffer() {}
++	void mute_video_dev(bool, bool) {}
++	bool start_record_video(int) { return false; }
++	void stop_record_video() {}
++	void restart_record_video() {}
++	bool now_record_video;
++	bool vm_screen_dirty;
++
++	// ---- sound ----
++	int sound_rate, sound_samples;
++	std::vector<int16_t> sound_out;            // interleaved stereo, filled by update_sound
++	int sound_out_frames;
++	bool sound_muted;
++	void initialize_sound(int rate, int samples, int *presented_rate, int *presented_samples);
++	void update_sound(int *extra_frames);
++	void mute_sound() { sound_muted = true; }
++	void unmute_sound() { sound_muted = false; }
++	void stop_sound() {}
++	void start_record_sound() {}
++	void stop_record_sound() {}
++	void restart_record_sound() {}
++	bool now_record_sound;
++	void add_extra_frames(int) {}
++
++	// ---- input ----
++	uint8_t key_status[256];
++	uint32_t joy_status[4];
++	int32_t mouse_status[3];
++	int32_t mouse_acc[2];       // movement accumulated by JS since the last frame
++	void update_input();
++	void key_down(int code, bool extended, bool repeat) { key_down_native(code, repeat); }
++	void key_up(int code, bool extended) { key_up_native(code); }
++	void key_down_native(int code, bool repeat);
++	void key_up_native(int code);
++	void key_lost_focus();
++	uint8_t *get_key_buffer() { return key_status; }
++	uint32_t *get_joy_buffer() { return joy_status; }
++	void release_joy_buffer(const uint32_t *) {}
++	const int32_t *get_mouse_buffer() { return mouse_status; }
++	int32_t get_mouse_button() { return mouse_status[2]; }
++	void release_mouse_buffer(const int32_t *) {}
++	void enable_mouse() { mouse_enabled = true; }
++	void disable_mouse() { mouse_enabled = false; }
++	void toggle_mouse() { mouse_enabled = !mouse_enabled; }
++	bool is_mouse_enabled() { return mouse_enabled; }
++	bool mouse_enabled;
++
++	// ---- printer bitmaps: unsupported, no-ops ----
++	void create_bitmap(bitmap_t *, int, int) {}
++	void release_bitmap(bitmap_t *) {}
++	void create_font(font_t *, const _TCHAR *, int, int, int, bool, bool) {}
++	void release_font(font_t *) {}
++	void create_pen(pen_t *, int, uint8_t, uint8_t, uint8_t) {}
++	void release_pen(pen_t *) {}
++	void clear_bitmap(bitmap_t *, uint8_t, uint8_t, uint8_t) {}
++	int get_text_width(bitmap_t *, font_t *, const char *) { return 16; }
++	void draw_text_to_bitmap(bitmap_t *, font_t *, int, int, const char *, uint8_t, uint8_t, uint8_t) {}
++	void draw_line_to_bitmap(bitmap_t *, pen_t *, int, int, int, int) {}
++	void draw_rectangle_to_bitmap(bitmap_t *, int, int, int, int, uint8_t, uint8_t, uint8_t) {}
++	void draw_point_to_bitmap(bitmap_t *, int, int, uint8_t, uint8_t, uint8_t) {}
++	void stretch_bitmap(bitmap_t *, int, int, int, int, bitmap_t *, int, int, int, int) {}
++	void write_bitmap_to_file(bitmap_t *, const _TCHAR *) {}
++
++	// ---- debugger hooks / movie / capture / midi / socket: unsupported ----
++	void start_waiting_in_debugger() {}
++	void finish_waiting_in_debugger() {}
++	void process_waiting_in_debugger() {}
++	bool open_movie_file(const _TCHAR *) { return false; }
++	void close_movie_file() {}
++	void play_movie() {}
++	void stop_movie() {}
++	void pause_movie() {}
++	double get_movie_frame_rate() { return 29.97; }
++	int get_movie_sound_rate() { return 44100; }
++	void set_cur_movie_frame(int, bool) {}
++	uint32_t get_cur_movie_frame() { return 0; }
++	int get_cur_capture_dev_index() { return 0; }
++	int get_num_capture_devs() { return 0; }
++	_TCHAR *get_capture_dev_name(int) { return (_TCHAR *)_T("DUMMY"); }
++	void open_capture_dev(int, bool) {}
++	void close_capture_dev() {}
++	void show_capture_dev_filter() {}
++	void show_capture_dev_pin() {}
++	void show_capture_dev_source() {}
++	void set_capture_dev_channel(int) {}
++	void send_to_midi(uint8_t, int) {}
++	bool recv_from_midi(uint8_t *, int) { return false; }
++	bool send_to_midi_timeout(uint8_t, int, uint64_t) { return true; }
++	bool recv_from_midi_timeout(uint8_t *, int, uint64_t) { return false; }
++	void reset_to_midi(int) {}
++	void initialize_midi_device(bool, bool, int) {}
++	void ready_send_to_midi(int) {}
++	void request_stop_to_receive_from_midi(int) {}
++	SOCKET get_socket(int) { return 0; }
++	void notify_socket_connected(int) {}
++	void notify_socket_disconnected(int) {}
++	bool initialize_socket_tcp(int) { return false; }
++	bool initialize_socket_udp(int) { return false; }
++	bool connect_socket(int, uint32_t, int) { return false; }
++	void disconnect_socket(int) {}
++	bool listen_socket(int) { return false; }
++	void send_socket_data_tcp(int) {}
++	void send_socket_data_udp(int, uint32_t, int) {}
++	void send_socket_data(int) {}
++	void recv_socket_data(int) {}
++	void update_socket() {}
++
++protected:
++	struct feat_t { int kind; double f; int64_t i; uint64_t u; };
++	std::map<std::string, feat_t> features;
++	int key_keep[256];
++};
++
++class OSD : public OSD_BASE {
++public:
++	OSD() : OSD_BASE() {}
++	~OSD() {}
++};
++
++#endif
+diff --git a/sdl/osd_features.inc b/sdl/osd_features.inc
+new file mode 100644
+index 0000000..448a073
+--- /dev/null
++++ b/sdl/osd_features.inc
+@@ -0,0 +1,1365 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++   Copyright (C) 2026 ZeR0-3
++   This file is part of the MZ-2800 Web Emulator, free software under the GNU GPL version 2 (see LICENSE). */
++// Generated from qt/osd.cpp (set_features*): VM #defines -> OSD feature table.
++// Included from sdl/osd_web.cpp inside namespace scope. Part of the web port.
++void OSD_BASE::set_features_machine(void)
++{
++// GIJUTSU-HYORON-SHA Babbase-2nd
++#ifdef _BABBAGE2ND
++	add_feature(_T("_BABBAGE2ND"), 1);
++#endif
++
++// HITACHI BASIC Master Jr
++#ifdef _BMJR
++	add_feature(_T("_BMJR"), 1);
++#endif
++
++// Systems Formulate BUBCOM80
++#ifdef _BUBCOM80
++	add_feature(_T("_BUBCOM80"), 1);
++#endif
++
++// CANON BX-1
++#ifdef _BX1
++	add_feature(_T("_BX1"), 1);
++#endif
++// Hino Electronics CEFUCOM-21
++#ifdef _CEFUCOM21
++	add_feature(_T("_CEFUCOM21"), 1);
++#endif
++
++// COLECO ColecoVision
++#ifdef _COLECOVISION
++	add_feature(_T("_COLECOVISION"), 1);
++#endif
++
++// Computer Research CRC-80
++#ifdef _CRC80
++	add_feature(_T("_CRC80"), 1);
++#endif
++// TOSHIBA EX-80
++#ifdef _EX80BS
++	add_feature(_T("_EX80BS"), 1);
++#endif
++
++// Nintendo Family BASIC
++#ifdef _FAMILYBASIC
++	add_feature(_T("_FAMILYBASIC"), 1);
++#endif
++
++// FUJITSU FM-8
++#ifdef _FM8
++	add_feature(_T("_FM8"), 1);
++#endif
++
++// FUJITSU FM-7
++#ifdef _FM7
++	add_feature(_T("_FM7"), 1);
++#endif
++
++// FUJITSU FM-NEW7
++#ifdef _FMNEW7
++	add_feature(_T("_FM7"), 1);
++	add_feature(_T("_FMNEW7"), 1);
++#endif
++
++// FUJITSU FM-77 SERIES
++#ifdef _FM77
++	add_feature(_T("_FM77"), 1);
++#endif
++
++#ifdef _FM77L2
++	add_feature(_T("_FM77L2"), 1);
++#endif
++
++#ifdef _FM77L4
++	add_feature(_T("_FM77L4"), 1);
++#endif
++
++#ifdef _FM77_VARIANTS
++	add_feature(_T("_FM77_VARIANTS"), 1);
++#endif
++
++// FUJITSU FM77AV SERIES
++#ifdef _FM77AV
++	add_feature(_T("_FM77AV"), 1);
++#endif
++
++#ifdef _FM77AV20
++	add_feature(_T("_FM77AV20"), 1);
++#endif
++
++#ifdef _FM77AV20EX
++	add_feature(_T("_FM77AV20EX"), 1);
++#endif
++
++#ifdef _FM77AV40
++	add_feature(_T("_FM77AV40"), 1);
++#endif
++
++#ifdef _FM77AV40SX
++	add_feature(_T("_FM77AV40SX"), 1);
++#endif
++
++#ifdef _FM77AV40EX
++	add_feature(_T("_FM77AV40EX"), 1);
++#endif
++
++#ifdef _FM77AV_VARIANTS
++	add_feature(_T("_FM77AV_VARIANTS"), 1);
++#endif
++
++// FUJITSU FM16beta
++#ifdef _FM16BETA
++	add_feature(_T("_FM16BETA"), 1);
++#endif
++
++// FUJITSU FM16pi
++#ifdef _FM16PI
++	add_feature(_T("_FM16PI"), 1);
++#endif
++
++// FUJITSU FMR-30
++#ifdef _FMR30
++	add_feature(_T("_FMR30"), 1);
++#endif
++
++// FUJITSU FMR-50
++#ifdef _FMR50
++	add_feature(_T("_FMR50"), 1);
++#endif
++
++// FUJITSU FMR-60
++#ifdef _FMR60
++	add_feature(_T("_FMR60"), 1);
++#endif
++
++#if defined(_FMTOWNS_1)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS_1"), 1);
++#endif
++#if defined(_FMTOWNS_2)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS_2"), 1);
++#endif
++#if defined(_FMTOWNS_1F)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS_1F"), 1);
++#endif
++#if defined(_FMTOWNS_2F)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS_2F"), 1);
++#endif
++#if defined(_FMTOWNS_1H)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS_1H"), 1);
++#endif
++#if defined(_FMTOWNS_2H)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS_2H"), 1);
++#endif
++#if defined(_FMTOWNS_10F)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS_10F"), 1);
++#endif
++#if defined(_FMTOWNS_20F)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS_20F"), 1);
++#endif
++#if defined(_FMTOWNS_40H)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS_40H"), 1);
++#endif
++#if defined(_FMTOWNS_80H)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS_80H"), 1);
++#endif
++#if defined(_FMTOWNS2_UX10)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_UX"), 1);
++	add_feature(_T("_FMTOWNS2_UX10"), 1);
++#endif
++#if defined(_FMTOWNS2_UX20)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_UX"), 1);
++	add_feature(_T("_FMTOWNS2_UX20"), 1);
++#endif
++#if defined(_FMTOWNS2_UX40)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_UX"), 1);
++	add_feature(_T("_FMTOWNS2_UX40"), 1);
++#endif
++#if defined(_FMTOWNS2_CX10)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_CX"), 1);
++	add_feature(_T("_FMTOWNS2_CX10"), 1);
++#endif
++#if defined(_FMTOWNS2_CX20)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_CX"), 1);
++	add_feature(_T("_FMTOWNS2_CX20"), 1);
++#endif
++#if defined(_FMTOWNS2_CX40)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_CX"), 1);
++	add_feature(_T("_FMTOWNS2_CX40"), 1);
++#endif
++#if defined(_FMTOWNS2_CX100)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_CX"), 1);
++	add_feature(_T("_FMTOWNS2_CX100"), 1);
++#endif
++#if defined(_FMTOWNS2_HG20)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_HG"), 1);
++	add_feature(_T("_FMTOWNS2_HG20"), 1);
++#endif
++#if defined(_FMTOWNS2_HG40)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_HG"), 1);
++	add_feature(_T("_FMTOWNS2_HG40"), 1);
++#endif
++#if defined(_FMTOWNS2_HG100)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_HG"), 1);
++	add_feature(_T("_FMTOWNS2_HG100"), 1);
++#endif
++#if defined(_FMTOWNS2_HR20)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_HR"), 1);
++	add_feature(_T("_FMTOWNS2_HR20"), 1);
++#endif
++#if defined(_FMTOWNS2_HR100)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_HR"), 1);
++	add_feature(_T("_FMTOWNS2_HR100"), 1);
++#endif
++#if defined(_FMTOWNS2_HR200)
++	add_feature(_T("_FMTOWNS"), 1);
++	add_feature(_T("_FMTOWNS2_HR"), 1);
++	add_feature(_T("_FMTOWNS2_HR200"), 1);
++#endif
++
++// CASIO FP-200
++#ifdef _FP200
++	add_feature(_T("_FP200"), 1);
++#endif
++
++// CASIO FP-1100
++#ifdef _FP1100
++	add_feature(_T("_FP1100"), 1);
++#endif
++
++// Panasonic FS-A1
++#ifdef _FSA1
++	add_feature(_T("_FSA1"), 1);
++#endif
++
++// CASIO FX-9000P
++#ifdef _FX9000P
++	add_feature(_T("_FX9000P"), 1);
++#endif
++
++// SEGA GAME GEAR
++#ifdef _GAMEGEAR
++	add_feature(_T("_GAMEGEAR"), 1);
++#endif
++
++// EPSON HC-20
++#ifdef _HC20
++	add_feature(_T("_HC20"), 1);
++#endif
++
++// EPSON HC-40
++#ifdef _HC40
++	add_feature(_T("_HC40"), 1);
++#endif
++
++// EPSON HC-80
++#ifdef _HC80
++	add_feature(_T("_HC80"), 1);
++#endif
++
++// TOSHIBA HX-20 + FDD
++#ifdef _HX20
++	add_feature(_T("_HX20"), 1);
++#endif
++
++// TOSHIBA J-3100GT
++#ifdef _J3100GT
++	add_feature(_T("_J3100GT"), 1);
++#endif
++
++// TOSHIBA J-3100SL
++#ifdef _J3100SL
++	add_feature(_T("_J3100SL"), 1);
++#endif
++
++// National JR-100
++#ifdef _JR100
++	add_feature(_T("_JR100"), 1);
++#endif
++
++// National JR-200
++#ifdef _JR200
++	add_feature(_T("_JR200"), 1);
++#endif
++
++// National JR-800
++#ifdef _JR800
++	add_feature(_T("_JR800"), 1);
++#endif
++
++// IBM Japan Ltd PC/JX
++#ifdef _JX
++	add_feature(_T("_JX"), 1);
++#endif
++
++// SORD M23
++#ifdef _M23
++	add_feature(_T("_M23"), 1);
++#endif
++
++// SORD m5
++#ifdef _M5
++	add_feature(_T("_M5"), 1);
++#endif
++
++// SORD M23
++#ifdef _M68
++	add_feature(_T("_M68"), 1);
++#endif
++
++// SEIKO MAP-1010
++#ifdef _MAP1010
++	add_feature(_T("_PHC25_BASE"), 1);
++	add_feature(_T("_MAP1010"), 1);
++#endif
++
++// SEGA MASTER SYSTEM
++#ifdef _MASTERSYSTEM
++	add_feature(_T("_MASTERSYSTEM"), 1);
++#endif
++
++// Nippon Mail Service MICOM MAHJONG
++#ifdef _MICOM_MAHJONG
++	add_feature(_T("_MICOM_MAHJONG"), 1);
++#endif
++
++// MITEC MP85
++#ifdef _MP85
++	add_feature(_T("_MP85"), 1);
++#endif
++
++// ASCII MSX
++#ifdef _MSX1
++	add_feature(_T("_MSX1"), 1);
++#endif
++
++// ASCII MSX2
++#ifdef _MSX2
++	add_feature(_T("_MSX2"), 1);
++#endif
++
++// ASCII MSX2+
++#ifdef _MSX2P
++	add_feature(_T("_MSX2P"), 1);
++#endif
++
++#ifdef _MSX1_VARIANTS
++	add_feature(_T("_MSX1_VARIANTS"), 1);
++#endif
++#ifdef _MSX2_VARIANTS
++	add_feature(_T("_MSX2_VARIANTS"), 1);
++#endif
++#ifdef _MSX2P_VARIANTS
++	add_feature(_T("_MSX2P_VARIANTS"), 1);
++#endif
++
++// MITSUBISHI Elec. MULTI8
++#ifdef _MULTI8
++	add_feature(_T("_MULTI8"), 1);
++#endif
++
++// Japan Electronics College MYCOMZ-80A
++#ifdef _MYCOMZ80A
++	add_feature(_T("_MYCOMZ80A"), 1);
++#endif
++
++// SHARP MZ-80A
++#ifdef _MZ80A
++	add_feature(_T("_MZ80A"), 1);
++#endif
++
++// SHARP MZ-80B
++#ifdef _MZ80B
++	add_feature(_T("_MZ80B"), 1);
++#endif
++
++// SHARP MZ-80K
++#ifdef _MZ80K
++	add_feature(_T("_MZ80K"), 1);
++#endif
++
++// SHARP MZ-700
++#ifdef _MZ700
++	add_feature(_T("_MZ700"), 1);
++#endif
++
++// SHARP MZ-800
++#ifdef _MZ800
++	add_feature(_T("_MZ800"), 1);
++#endif
++
++// SHARP MZ-1200
++#ifdef _MZ1200
++	add_feature(_T("_MZ1200"), 1);
++#endif
++
++// SHARP MZ-1500
++#ifdef _MZ1500
++	add_feature(_T("_MZ1500"), 1);
++#endif
++
++// SHARP MZ-2000
++#ifdef _MZ2000
++	add_feature(_T("_MZ2000"), 1);
++#endif
++
++// SHARP MZ-2200
++#ifdef _MZ2200
++	add_feature(_T("_MZ2200"), 1);
++#endif
++
++// SHARP MZ-2500
++#ifdef _MZ2500
++	add_feature(_T("_MZ2500"), 1);
++#endif
++
++// SHARP MZ-2800
++#ifdef _MZ2800
++	add_feature(_T("_MZ2800"), 1);
++#endif
++
++// SHARP MZ-3500
++#ifdef _MZ3500
++	add_feature(_T("_MZ3500"), 1);
++#endif
++
++// SHARP MZ-5500
++#ifdef _MZ5500
++	add_feature(_T("_MZ5500"), 1);
++#endif
++
++// SHARP MZ-6500
++#ifdef _MZ6500
++	add_feature(_T("_MZ6500"), 1);
++#endif
++
++// SHARP MZ-6550
++#ifdef _MZ6550
++	add_feature(_T("_MZ6550"), 1);
++#endif
++
++// NEC N5200
++#ifdef _N5200
++	add_feature(_T("_N5200"), 1);
++#endif
++
++// TOSHIBA PASOPIA
++#ifdef _PASOPIA
++	add_feature(_T("_PASOPIA"), 1);
++#endif
++
++// TOSHIBA PASOPIA 7
++#ifdef _PASOPIA7
++	add_feature(_T("_PASOPIA7"), 1);
++#endif
++
++// NEC PC-2001
++#ifdef _PC2001
++	add_feature(_T("_PC2001"), 1);
++#endif
++
++// NEC PC-6001
++#ifdef _PC6001
++	add_feature(_T("_PC6001"), 1);
++#endif
++
++// NEC PC-6001mkII
++#ifdef _PC6001MK2
++	add_feature(_T("_PC6001MK2"), 1);
++#endif
++
++// NEC PC-6001mkIISR
++#ifdef _PC6001MK2SR
++	add_feature(_T("_PC6001MK2SR"), 1);
++#endif
++
++// NEC PC-6601
++#ifdef _PC6601
++	add_feature(_T("_PC6601"), 1);
++#endif
++
++// NEC PC-6601SR
++#ifdef _PC6601SR
++	add_feature(_T("_PC6601SR"), 1);
++#endif
++
++// NEC PC-8001
++#ifdef _PC8001
++	add_feature(_T("_PC8001"), 1);
++#endif
++
++// NEC PC-8001mkII
++#ifdef _PC8001MK2
++	add_feature(_T("_PC8001MK2"), 1);
++#endif
++// NEC PC-8001mkIISR
++#ifdef _PC8001SR
++	add_feature(_T("_PC8001SR"), 1);
++#endif
++
++// NEC PC-8201
++#ifdef _PC8201
++	add_feature(_T("_PC8201"), 1);
++#endif
++
++// NEC PC-8201A
++#ifdef _PC8201A
++	add_feature(_T("_PC8201A"), 1);
++#endif
++
++// NEC PC-8801
++#ifdef _PC8801
++	add_feature(_T("_PC8801"), 1);
++#endif
++
++// NEC PC-8801mkII
++#ifdef _PC8801MK2
++	add_feature(_T("_PC8801MK2"), 1);
++#endif
++// NEC PC-8801MA
++#ifdef _PC8801MA
++	add_feature(_T("_PC8801MA"), 1);
++#endif
++#ifdef _PC8801SR
++	add_feature(_T("_PC8801SR"), 1);
++#endif
++
++#ifdef PC8001_VARIANT
++	add_feature(_T("PC8001_VARIANT"), 1);
++#endif
++#ifdef PC8801_VARIANT
++	add_feature(_T("PC8801_VARIANT"), 1);
++#endif
++#ifdef PC8801SR_VARIANT
++	add_feature(_T("PC8801SR_VARIANT"), 1);
++#endif
++
++// NEC PC-9801
++#ifdef _PC9801
++	add_feature(_T("_PC9801"), 1);
++#endif
++
++// NEC PC-9801E/F/M
++#ifdef _PC9801E
++	add_feature(_T("_PC9801E"), 1);
++#endif
++
++// NEC PC-9801U
++#ifdef _PC9801U
++	add_feature(_T("_PC9801U"), 1);
++#endif
++
++// NEC PC-9801VF
++#ifdef _PC9801VF
++	add_feature(_T("_PC9801VF"), 1);
++#endif
++
++// NEC PC-9801VM
++#ifdef _PC9801VM
++	add_feature(_T("_PC9801VM"), 1);
++#endif
++
++// NEC PC-9801VX
++#ifdef _PC9801VX
++	add_feature(_T("_PC9801VX"), 1);
++#endif
++// NEC PC-9801RA
++#ifdef _PC9801RA
++	add_feature(_T("_PC9801RA"), 1);
++#endif
++
++// NEC PC-98DO
++#ifdef _PC98DO
++	add_feature(_T("_PC98DO"), 1);
++#endif
++
++// NEC PC-98HA
++#ifdef _PC98HA
++	add_feature(_T("_PC98HA"), 1);
++#endif
++
++// NEC PC-98LT
++#ifdef _PC98LT
++	add_feature(_T("_PC98LT"), 1);
++#endif
++
++// NEC PC-98RL
++#ifdef _PC98RL
++	add_feature(_T("_PC98RL"), 1);
++#endif
++
++// NEC PC-98XA
++#ifdef _PC98XA
++	add_feature(_T("_PC98XA"), 1);
++#endif
++
++// NEC PC-98RL
++#ifdef _PC98XL
++	add_feature(_T("_PC98XL"), 1);
++#endif
++
++// NEC PC-100
++#ifdef _PC100
++	add_feature(_T("_PC100"), 1);
++#endif
++
++// NEC-HE PC Engine
++#ifdef _PCENGINE
++	add_feature(_T("_PCENGINE"), 1);
++#endif
++
++// SANYO PHC-20
++#ifdef _PHC20
++	add_feature(_T("_PHC20"), 1);
++#endif
++
++// SANYO PHC-25
++#ifdef _PHC25
++	add_feature(_T("_PHC25_BASE"), 1);
++	add_feature(_T("_PHC25"), 1);
++#endif
++
++// CASIO PV-1000
++#ifdef _PV1000
++	add_feature(_T("_PV1000"), 1);
++#endif
++
++// CASIO PV-2000
++#ifdef _PV2000
++	add_feature(_T("_PV2000"), 1);
++#endif
++
++// PIONEER PX-7
++#ifdef _PX7
++	add_feature(_T("_PX7"), 1);
++#endif
++
++// TOMY PYUTA
++#ifdef _PYUTA
++	add_feature(_T("_PYUTA"), 1);
++#endif
++
++// EPSON QC-10
++#ifdef _QC10
++	add_feature(_T("_QC10"), 1);
++#endif
++
++// BANDAI RX-78
++#ifdef _RX78
++	add_feature(_T("_RX78"), 1);
++#endif
++
++// SEGA SC-3000
++#ifdef _SC3000
++	add_feature(_T("_SC3000"), 1);
++#endif
++
++// EPOCH Super Cassette Vision
++#ifdef _SCV
++	add_feature(_T("_SCV"), 1);
++#endif
++
++// SHARP SM-B-80TE
++#ifdef _SMB80TE
++	add_feature(_T("_SMB80TE"), 1);
++#endif
++
++// SONY SMC-70
++#ifdef _SMC70
++	add_feature(_T("_SMC70"), 1);
++#endif
++
++// SONY SMC-777
++#ifdef _SMC777
++	add_feature(_T("_SMC777"), 1);
++#endif
++
++// SPECTRAVIDEO SVI-3x8
++#ifdef _SVI3X8
++	add_feature(_T("_SVI3X8"), 1);
++#endif
++
++// NEC TK-80BS (COMPO BS/80)
++#ifdef _TK80BS
++	add_feature(_T("_TK80BS"), 1);
++#endif
++
++// NEC TK-80
++#ifdef _TK80
++	add_feature(_T("_TK80"), 1);
++#endif
++
++// NEC TK-85
++#ifdef _TK85
++	add_feature(_T("_TK85"), 1);
++#endif
++
++// ESP TRN Junior
++#ifdef _TRNJR
++	add_feature(_T("_TRNJR"), 1);
++#endif
++
++// GAKKEN TV BOY
++#ifdef _TVBOY
++	add_feature(_T("_TVBOY"), 1);
++#endif
++
++// CANON X-07
++#ifdef _X07
++	add_feature(_T("_X07"), 1);
++#endif
++
++// SHARP X1
++#ifdef _X1
++	add_feature(_T("_X1"), 1);
++	add_feature(_T("_X1_SERIES"), 1);
++#endif
++
++// SHARP X1turbo
++#ifdef _X1TURBO
++	add_feature(_T("_X1TURBO"), 1);
++	add_feature(_T("_X1_SERIES"), 1);
++#endif
++// SHARP X1turboZ
++#ifdef _X1TURBOZ
++	add_feature(_T("_X1TURBOZ"), 1);
++	add_feature(_T("_X1_SERIES"), 1);
++#endif
++
++// SHARP X1twin
++#ifdef _X1TWIN
++	add_feature(_T("_X1TWIN"), 1);
++	add_feature(_T("_X1_SERIES"), 1);
++#endif
++
++// Yuasa Kyouiku System YALKY
++#ifdef _YALKY
++	add_feature(_T("_YALKY"), 1);
++#endif
++
++// YAMAHA YIS
++#ifdef _YIS
++	add_feature(_T("_YIS"), 1);
++#endif
++
++// SHINKO SANGYO YS-6464A
++#ifdef _YS6464A
++	add_feature(_T("_YS6464A"), 1);
++#endif
++
++// Homebrew Z80 TV GAME SYSTEM
++#ifdef _Z80TVGAME
++	add_feature(_T("_Z80TVGAME"), 1);
++#endif
++}
++
++void OSD_BASE::set_features_cpu(void)
++{
++#ifdef HAS_I86
++	add_feature(_T("HAS_I86"), 1);
++#endif
++#ifdef HAS_I88
++	add_feature(_T("HAS_I88"), 1);
++#endif
++#ifdef HAS_I186
++	add_feature(_T("HAS_I186"), 1);
++#endif
++#ifdef HAS_I286
++	add_feature(_T("HAS_I286"), 1);
++#endif
++#ifdef HAS_I386
++	add_feature(_T("HAS_I386"), 1);
++#endif
++#ifdef HAS_I386DX
++	add_feature(_T("HAS_I386DX"), 1);
++#endif
++#ifdef HAS_I386SX
++	add_feature(_T("HAS_I386SX"), 1);
++#endif
++#ifdef HAS_I486
++	add_feature(_T("HAS_I486"), 1);
++#endif
++#ifdef HAS_I486SX
++	add_feature(_T("HAS_I486SX"), 1);
++#endif
++#ifdef HAS_I486DX
++	add_feature(_T("HAS_I486DX"), 1);
++#endif
++#ifdef HAS_PENTIUM
++	add_feature(_T("HAS_PENTIUM"), 1);
++#endif
++#ifdef HAS_PENTIUM_PRO
++	add_feature(_T("HAS_PENTIUM_PRO"), 1);
++#endif
++#ifdef HAS_PENTIUM_MMX
++	add_feature(_T("HAS_PENTIUM_MMX"), 1);
++#endif
++#ifdef HAS_PENTIUM2
++	add_feature(_T("HAS_PENTIUM2"), 1);
++#endif
++#ifdef HAS_PENTIUM2
++	add_feature(_T("HAS_PENTIUM3"), 1);
++#endif
++#ifdef HAS_PENTIUM2
++	add_feature(_T("HAS_PENTIUM4"), 1);
++#endif
++
++#ifdef HAS_V30
++	add_feature(_T("HAS_V30"), 1);
++#endif
++#ifdef HAS_I8080
++	add_feature(_T("HAS_I8080"), 1);
++#endif
++#ifdef HAS_I8085
++	add_feature(_T("HAS_I8085"), 1);
++#endif
++#ifdef HAS_N2A03
++	add_feature(_T("HAS_N2A03"), 1);
++#endif
++#ifdef HAS_MC6800
++	add_feature(_T("HAS_MC6800"), 1);
++#endif
++#ifdef HAS_MC6801
++	add_feature(_T("HAS_MC6801"), 1);
++#endif
++#ifdef HAS_HD6301
++	add_feature(_T("HAS_HD6301"), 1);
++#endif
++#ifdef HAS_NSC800
++	add_feature(_T("HAS_NSC800"), 1);
++#endif
++#ifdef I80186
++	add_feature(_T("I80186"), 1);
++#endif
++#ifdef I80286
++	add_feature(_T("I80286"), 1);
++#endif
++#ifdef RS6000
++	add_feature(_T("RS6000"), 1);
++#endif
++
++#ifdef I86_PSEUDO_BIOS
++	add_feature(_T("I86_PSEUDO_BIOS"), 1);
++#endif
++#ifdef I286_PSEUDO_BIOS
++	add_feature(_T("I286_PSEUDO_BIOS"), 1);
++#endif
++#ifdef I386_PSEUDO_BIOS
++	add_feature(_T("I386_PSEUDO_BIOS"), 1);
++#endif
++#ifdef Z80_PSEUDO_BIOS
++	add_feature(_T("Z80_PSEUDO_BIOS"), 1);
++#endif
++
++}
++
++void OSD_BASE::set_features_vm(void)
++{
++// Begin vm.h
++#ifdef USE_STATE
++	add_feature(_T("USE_STATE"), 1);
++#endif
++#ifdef FRAMES_PER_SEC
++	add_feature(_T("BASE_FRAMES_PER_SEC"), (double)FRAMES_PER_SEC);
++#endif
++#ifdef USE_CART
++	add_feature(_T("MAX_CART"), (int)USE_CART);
++	add_feature(_T("USE_CART"), (int)USE_CART);
++#endif
++#ifdef BASE_CART_NUM
++	add_feature(_T("BASE_CART_NUM"), (int)BASE_CART_NUM);
++#endif
++
++#if defined(USE_FLOPPY_DISK)
++	add_feature(_T("MAX_FD"), (int)USE_FLOPPY_DISK);
++	add_feature(_T("USE_FLOPPY_DISK"), (int)USE_FLOPPY_DISK);
++#endif
++#ifdef BASE_FLOPPY_DISK_NUM
++	add_feature(_T("BASE_FLOPPY_DISK_NUM"), (int)BASE_FLOPPY_DISK_NUM);
++#endif
++
++#ifdef USE_QUICK_DISK
++	add_feature(_T("USE_QUICK_DISK"), (int)USE_QUICK_DISK);
++	add_feature(_T("MAX_QD"), (int)USE_QUICK_DISK);
++#endif
++#ifdef BASE_QUICK_DISK_NUM
++	add_feature(_T("BASE_QUICK_DISK_NUM"), (int)BASE_QUICK_DISK_NUM);
++#endif
++
++#ifdef USE_HARD_DISK
++	add_feature(_T("USE_HARD_DISK"), (int)USE_HARD_DISK);
++	add_feature(_T("MAX_HDD"), (int)USE_HARD_DISK);
++#endif
++#ifdef BASE_HARD_DISK_NUM
++	add_feature(_T("BASE_HARD_DISK_NUM"), (int)BASE_HARD_DISK_NUM);
++#endif
++
++#ifdef USE_COMPACT_DISC
++	add_feature(_T("USE_COMPACT_DISC"), (int)USE_COMPACT_DISC);
++	add_feature(_T("MAX_CD"), (int)USE_COMPACT_DISC);
++#endif
++#ifdef BASE_COMPACT_DISC_NUM
++	add_feature(_T("BASE_COMPACT_DISC_NUM"), (int)BASE_COMPACT_DISC_NUM);
++#endif
++
++#ifdef USE_LASER_DISC
++	add_feature(_T("USE_LASER_DISC"), (int)USE_LASER_DISC);
++	add_feature(_T("MAX_LD"), (int)USE_LASER_DISC);
++#endif
++#ifdef BASE_LASER_DISC_NUM
++	add_feature(_T("BASE_LASER_DISC_NUM"), (int)BASE_LASER_DISC_NUM);
++#endif
++
++#ifdef USE_TAPE
++	add_feature(_T("USE_TAPE"), (int)USE_TAPE);
++	add_feature(_T("MAX_TAPE"), (int)USE_TAPE);
++#endif
++#ifdef BASE_TAPE_NUM
++	add_feature(_T("BASE_TAPE_NUM"), (int)BASE_TAPE_NUM);
++#endif
++
++#ifdef USE_BINARY_FILE
++	add_feature(_T("USE_BINARY_FILE"), (int)USE_BINARY_FILE);
++	add_feature(_T("MAX_BINARY"), (int)USE_BINARY_FILE);
++#endif
++#ifdef BASE_BINARY_FILE_NUM
++	add_feature(_T("BASE_BINARY_FILE_NUM"), (int)BASE_BINARY_FILE_NUM);
++#endif
++
++#ifdef USE_BUBBLE
++	add_feature(_T("USE_BUBBLE"), (int)USE_BUBBLE);
++	add_feature(_T("MAX_BUBBLE"), (int)USE_BUBBLE);
++#endif
++#ifdef BASE_BUBBLE_NUM
++	add_feature(_T("BASE_BUBBLE_NUM"), (int)BASE_BUBBLE_NUM);
++#endif
++	
++#ifdef USE_SOCKET
++	add_feature(_T("USE_SOCKET"), 1);
++#endif	
++
++#ifdef ONE_BOARD_MICRO_COMPUTER
++	add_feature(_T("ONE_BOARD_MICRO_COMPUTER"), 1);
++#endif	
++	
++#ifdef USE_AUTO_KEY
++	add_feature(_T("USE_AUTO_KEY"), 1);
++#endif	
++#ifdef KEY_KEEP_FRAMES
++	add_feature(_T("KEY_KEEP_FRAMES"), (int)KEY_KEEP_FRAMES);
++#endif
++#ifdef USE_MOVIE_PLAYER
++	add_feature(_T("USE_MOVIE_PLAYER"), 1);
++#endif
++#ifdef CPU_CLOCKS
++	add_feature(_T("CPU_CLOCKS"), (int64_t)CPU_CLOCKS);
++#endif
++#ifdef SCREEN_WIDTH
++	add_feature(_T("SCREEN_WIDTH"), (int)SCREEN_WIDTH);
++#endif
++#ifdef SCREEN_HEIGHT
++	add_feature(_T("SCREEN_HEIGHT"), (int)SCREEN_HEIGHT);
++#endif
++#ifdef SUPPORT_TV_RENDER
++	add_feature(_T("SUPPORT_TV_RENDER"), 1);
++#endif
++#ifdef USE_PRINTER
++	add_feature(_T("USE_PRINTER"), 1);
++	#ifdef USE_PRINTER_TYPE	
++	add_feature(_T("USE_PRINTER_TYPE"), (int)USE_PRINTER_TYPE);
++	#endif
++#endif	
++// End vm.h
++
++#ifdef APU_CLOCK
++	add_feature(_T("APU_CLOCK"), (int64_t)APU_CLOCK);
++#endif
++
++
++#ifdef MAX_DRIVE
++	add_feature(_T("MAX_DRIVE"), (int)MAX_DRIVE);
++#endif
++
++#ifdef HD46505_CHAR_CLOCK
++	add_feature(_T("HD46505_CHAR_CLOCK"), (float)HD46505_CHAR_CLOCK);
++#endif
++#ifdef HD46505_HORIZ_FREQ
++	add_feature(_T("HD46505_HORIZ_FREQ"), (float)HD46505_HORIZ_FREQ);
++#endif
++#ifdef _315_5124_LIMIT_SPRITES
++	add_feature(_T("_315_5124_LIMIT_SPRITES"), 1);
++#endif
++#ifdef HAS_AY_3_8910
++	add_feature(_T("HAS_AY_3_8910"));
++#endif
++#ifdef HAS_AY_3_8912
++	add_feature(_T("HAS_AY_3_8912"));
++#endif
++#ifdef HAS_AY_3_8913
++	add_feature(_T("HAS_AY_3_8913"));
++#endif
++#ifdef SUPPORT_AY_3_891X_PORT
++	add_feature(_T("SUPPORT_AY_3_891X_PORT"), 1);
++#endif
++#ifdef AY_3_891X_PORT_MODE
++	add_feature(_T("AY_3_891X_PORT_MODE"), (uint32_t)AY_3_891X_PORT_MODE);
++#endif
++#ifdef SUPPORT_AY_3_891X_PORT_A
++	add_feature(_T("SUPPORT_AY_3_891X_PORT_A"), 1);
++#endif
++#ifdef SUPPORT_AY_3_891X_PORT_B
++	add_feature(_T("SUPPORT_AY_3_891X_PORT_B"), 1);
++#endif
++#ifdef DATAREC_FAST_FWD_SPEED
++	add_feature(_T("DATAREC_FAST_FWD_SPEED"), (double)DATAREC_FAST_FWD_SPEED);
++#endif
++#ifdef DATAREC_FAST_REW_SPEED
++	add_feature(_T("DATAREC_FAST_REW_SPEED"), (double)DATAREC_FAST_REW_SPEED);
++#endif
++#ifdef DATAREC_PCM_VOLUME
++	add_feature(_T("DATAREC_PCM_VOLUME"), (int)DATAREC_PCM_VOLUME);
++#endif
++
++#ifdef I8255_AUTO_HAND_SHAKE
++	add_feature(_T("I8255_AUTO_HAND_SHAKE"), 1);
++#endif
++#ifdef HAS_MB8866
++	add_feature(_T("HAS_MB8866"), 1);
++#endif
++#ifdef HAS_MB8876
++	add_feature(_T("HAS_MB8876"), 1);
++#endif
++#ifdef HAS_MB89311
++	add_feature(_T("HAS_MB89311"), 1);
++#endif
++#ifdef MB8877_NO_BUSY_AFTER_SEEK
++	add_feature(_T("MB8877_NO_BUSY_AFTER_SEEK"), 1);
++#endif
++#ifdef MB8877_DELAY_AFTER_SEEK
++	add_feature(_T("MB8877_DELAY_AFTER_SEEK"), (int)MB8877_DELAY_AFTER_SEEK);
++#endif
++
++#ifdef I8259_PC98_HACK
++	add_feature(_T("I8259_PC98_HACK"), 1);
++#endif
++
++#ifdef MC6847_VRAM_OFS
++	add_feature(_T("MC6847_VRAM_OFS"), (uint32_t)MC6847_VRAM_OFS);
++#endif
++#ifdef MC6847_VRAM_AS
++	add_feature(_T("MC6847_VRAM_AS"), (uint32_t)MC6847_VRAM_AS);
++#endif
++#ifdef MC6847_VRAM_CSS
++	add_feature(_T("MC6847_VRAM_CSS"), (uint32_t)MC6847_VRAM_CSS);
++#endif
++#ifdef MC6847_VRAM_INV
++	add_feature(_T("MC6847_VRAM_INV"), (uint32_t)MC6847_VRAM_INV);
++#endif
++#ifdef MC6847_VRAM_INTEXT
++	add_feature(_T("MC6847_VRAM_INTEXT"), (uint32_t)MC6847_VRAM_INTEXT);
++#endif
++
++#ifdef MC6847_ATTR_OFS
++	add_feature(_T("MC6847_ATTR_OFS"), (uint32_t)MC6847_ATTR_OFS);
++#endif
++#ifdef MC6847_ATTR_AS
++	add_feature(_T("MC6847_ATTR_AS"), (uint32_t)MC6847_ATTR_AS);
++#endif
++#ifdef MC6847_ATTR_CSS
++	add_feature(_T("MC6847_ATTR_CSS"), (uint32_t)MC6847_ATTR_CSS);
++#endif
++#ifdef MC6847_ATTR_INV
++	add_feature(_T("MC6847_ATTR_INV"), (uint32_t)MC6847_ATTR_INV);
++#endif
++#ifdef MC6847_ATTR_INTEXT
++	add_feature(_T("MC6847_ATTR_INTEXT"), (uint32_t)MC6847_ATTR_INTEXT);
++#endif
++
++#ifdef MSM58321_START_DAY
++	add_feature(_T("MSM58321_START_DAY"), (int)MSM58321_START_DAY);
++#endif
++#ifdef MSM58321_START_YEAR
++	add_feature(_T("MSM58321_START_YEAR"), (int)MSM58321_START_YEAR);
++#endif
++#ifdef HAS_MSM5832
++	add_feature(_T("HAS_MSM5832"), 1);
++#endif
++#ifdef PRINTER_STROBE_RISING_EDGE
++	add_feature(_T("PRINTER_STROBE_RISING_EDGE"), 1);
++#endif
++#ifdef MZ1P17_SW1_4_ON
++	add_feature(_T("MZ1P17_SW1_4_ON"), 1);
++#endif
++#ifdef DOT_PRINT
++	add_feature(_T("DOT_PRINT"), 1);
++#endif
++
++#ifdef PC80S31K_NO_WAIT
++	add_feature(_T("PC80S31K_NO_WAIT"), 1);
++#endif
++
++#ifdef HAS_RP5C15
++	add_feature(_T("HAS_RP5C15"), 1);
++#endif
++
++#ifdef SCSI_DEV_IMMEDIATE_SELECT
++	add_feature(_T("SCSI_DEV_IMMEDIATE_SELECT"), 1);
++#endif
++#ifdef SCSI_HOST_WIDE
++	add_feature(_T("SCSI_HOST_WIDE"), 1);
++#endif
++#ifdef SCSI_HOST_AUTO_ACK
++	add_feature(_T("SCSI_HOST_AUTO_ACK"), 1);
++#endif
++
++#ifdef HAS_SN76489
++	add_feature(_T("HAS_SN76489"), 1);
++#endif
++#ifdef HAS_T3444M
++	add_feature(_T("HAS_T3444M"), 1);
++#endif
++
++#ifdef TMS9918A_VRAM_SIZE
++	add_feature(_T("TMS9918A_VRAM_SIZE"), (uint32_t)TMS9918A_VRAM_SIZE);
++#endif
++#ifdef TMS9918A_SUPER_IMPOSE
++	add_feature(_T("TMS9918A_SUPER_IMPOSE"), 1);
++#endif
++#ifdef TMS9918A_LIMIT_SPRITES
++	add_feature(_T("TMS9918A_LIMIT_SPRITES"), 1);
++#endif
++
++#ifdef TIMER_HACK
++	add_feature(_T("TIMER_HACK"));
++#endif
++#ifdef KEYBOARD_HACK
++	add_feature(_T("KEYBOARD_HACK"));
++#endif
++
++#ifdef HAS_UPD7907
++	add_feature(_T("HAS_UPD7907"), 1);
++#endif
++#ifdef HAS_UPD4990A
++	add_feature(_T("HAS_UPD4990A"), 1);
++#endif
++#ifdef UPD7220_HORIZ_FREQ
++	add_feature(_T("UPD7220_HORIZ_FREQ"), (int)UPD7220_HORIZ_FREQ);
++#endif
++#ifdef UPD7220_UGLY_PC98_HACK
++	add_feature(_T("UPD7220_UGLY_PC98_HACK"), 1);
++#endif
++#ifdef UPD7220_FIXED_PITCH
++	add_feature(_T("UPD7220_FIXED_PITCH"), 1);
++#endif
++#ifdef UPD7220_MSB_FIRST
++	add_feature(_T("UPD7220_MSB_FIRST"), 1);
++#endif
++#ifdef UPD7220_A_VERSION
++	add_feature(_T("UPD7220_A_VERSION"), (int)UPD7220_A_VERSION);
++#endif
++#ifdef UPD765A_DMA_MODE
++	add_feature(_T("UPD765A_DMA_MODE"), 1);
++#endif
++#ifdef UPD765A_EXT_DRVSEL
++	add_feature(_T("UPD765A_EXT_DRVSEL"), 1);
++#endif
++#ifdef UPD765A_SENCE_INTSTAT_RESULT
++	add_feature(_T("UPD765A_SENCE_INTSTAT_RESULT"), 1);
++#endif
++#ifdef UPD765A_DONT_WAIT_SEEK
++	add_feature(_T("UPD765A_DONT_WAIT_SEEK"), 1);
++#endif
++#ifdef UPD765A_NO_ST0_AT_FOR_SEEK
++	add_feature(_T("UPD765A_NO_ST0_AT_FOR_SEEK"), 1);
++#endif
++#ifdef UPD765A_WAIT_RESULT7
++	add_feature(_T("UPD765A_WAIT_RESULT7"), 1);
++#endif
++#ifdef UPD765A_NO_ST1_EN_OR_FOR_RESULT7
++	add_feature(_T("UPD765A_NO_ST1_EN_OR_FOR_RESULT7"), 1);
++#endif
++
++#ifdef HAS_UPD7810
++	add_feature(_T("HAS_UPD7810"), 1);
++#endif
++#ifdef HAS_UPD7807
++	add_feature(_T("HAS_UPD7807"), 1);
++#endif
++#ifdef HAS_UPD7801
++	add_feature(_T("HAS_UPD7801"), 1);
++#endif
++#ifdef HAS_UPD78C05
++	add_feature(_T("HAS_UPD78C05"), 1);
++#endif
++#ifdef HAS_UPD78C06
++	add_feature(_T("HAS_UPD78C06"), 1);
++#endif
++#ifdef HAS_UPD7907
++	add_feature(_T("HAS_UPD7907"), 1);
++#endif
++
++#ifdef HAS_YM2608
++	add_feature(_T("HAS_YM2608"), 1);
++#endif
++#ifdef HAS_YM_SERIES
++	add_feature(_T("HAS_YM_SERIES"), 1);
++#endif
++#ifdef SUPPORT_YM2203_PORT
++	add_feature(_T("SUPPORT_YM2203_PORT"), 1);
++#endif
++#ifdef SUPPORT_YM2203_PORT_A
++	add_feature(_T("SUPPORT_YM2203_PORT_A"), 1);
++#endif
++#ifdef SUPPORT_YM2203_PORT_B
++	add_feature(_T("SUPPORT_YM2203_PORT_B"), 1);
++#endif
++
++#ifdef HAS_LDAIR_QUIRK
++	add_feature(_T("HAS_LDAIR_QUIRK"), 1);
++#endif
++#ifdef Z80CTC_CLOCKS
++	add_feature(_T("Z80CTC_CLOCKS"), (double)Z80CTC_CLOCKS);
++#endif
++#ifdef HAS_UPD7201
++	add_feature(_T("HAS_UPD7201"), 1);
++#endif
++
++#ifdef _X1TURBO_FEATURE
++	add_feature(_T("_X1TURBO_FEATURE"), 1);
++#endif
++}
++
++void OSD_BASE::set_features_debug(void)
++{
++
++#ifdef USE_DEBUGGER
++	add_feature(_T("USE_DEBUGGER"), 1);
++#endif
++#ifdef _DEBUG_LOG
++	add_feature(_T("_DEBUG_LOG"), 1);
++#endif
++#ifdef _FDC_DEBUG_LOG
++	add_feature(_T("_FDC_DEBUG_LOG"), 1);
++#endif
++#ifdef _IO_DEBUG_LOG
++	add_feature(_T("_IO_DEBUG_LOG"), 1);
++#endif
++#ifdef DEBUG_MISSING_OPCODE
++	add_feature(_T("DEBUG_MISSING_OPCODE"), 1);
++#endif
++#ifdef _SCSI_DEBUG_LOG
++	add_feature(_T("_SCSI_DEBUG_LOG"), 1);
++#endif
++#ifdef _CDROM_DEBUG_LOG
++	add_feature(_T("_CDROM_DEBUG_LOG"), 1);
++#endif
++#ifdef _DEBUG_PC80S31K
++	add_feature(_T("_DEBUG_PC80S31K"), 1);
++#endif
++#ifdef DMA_DEBUG_LOG
++	add_feature(_T("DMA_DEBUG_LOG"), 1);
++#endif
++#ifdef SIO_DEBUG
++	add_feature(_T("SIO_DEBUG"), 1);
++#endif
++}
++
++void OSD_BASE::set_features_misc(void)
++{
++#ifdef LSB_FIRST
++	add_feature(_T("LSB_FIRST"), 1);
++#endif
++#ifdef SINGLE_MODE_DMA
++	add_feature(_T("SINGLE_MODE_DMA"), 1);
++#endif
++#ifdef MEMORY_ADDR_MAX
++	add_feature(_T("MEMORY_ADDR_MAX"), (uint64_t)MEMORY_ADDR_MAX);
++#endif
++#ifdef MEMORY_BANK_SIZE
++	add_feature(_T("MEMORY_BANK_SIZE"), (uint64_t)MEMORY_BANK_SIZE);
++#endif
++#ifdef IOBUS_RETURN_ADDR
++	add_feature(_T("IOBUS_RETURN_ADDR"), 1);
++#endif
++#ifdef IO_ADDR_MAX
++	add_feature(_T("IO_ADDR_MAX"), (uint32_t)IO_ADDR_MAX);
++#endif
++#ifdef CPU_START_ADDR
++	add_feature(_T("CPU_START_ADDR"), (uint32_t)CPU_START_ADDR);
++#endif
++
++#ifdef LOW_PASS_FILTER
++	add_feature(_T("LOW_PASS_FILTER"), 1);
++#endif
++
++#ifdef USE_VIDEO_CAPTURE
++	add_feature(_T("USE_VIDEO_CAPTURE"), 1);
++#endif
++#ifdef SUPPORT_MAME_FM_DLL
++	add_feature(_T("SUPPORT_MAME_FM_DLL"), 1);
++#endif
++#ifdef SUPPORT_WIN32_DLL
++	add_feature(_T("SUPPORT_WIN32_DLL"), 1);
++#endif
++
++#ifdef CHARS_PER_LINE
++	add_feature(_T("CHARS_PER_LINE"), (int)CHARS_PER_LINE);
++#endif
++#ifdef LINES_PER_FRAME
++	add_feature(_T("LINES_PER_FRAME"), (int)LINES_PER_FRAME);
++#endif
++#ifdef USE_ALPHA_BLENDING_TO_IMPOSE
++	add_feature(_T("USE_ALPHA_BLENDING_TO_IMPOSE"), 1);
++#endif
++#ifdef SUPPORT_MEDIA_TYPE_1DD
++	add_feature(_T("SUPPORT_MEDIA_TYPE_1DD"), 1);
++#endif
++#ifdef DATAREC_SOUND
++	add_feature(_T("DATAREC_SOUND"), 1);
++#endif
++#ifdef DATAREC_SOUND_LEFT
++	add_feature(_T("DATAREC_SOUND_LEFT"), 1);
++#endif
++#ifdef DATAREC_SOUND_RIGHT
++	add_feature(_T("DATAREC_SOUND_RIGHT"), 1);
++#endif
++#ifdef SUPPORT_QUERY_PHY_KEY_NAME
++	add_feature(_T("SUPPORT_QUERY_PHY_KEY_NAME"), 1);
++#endif
++}
++
++void OSD_BASE::set_features(void)
++{
++	set_features_machine();
++	set_features_cpu();
++	set_features_vm();
++	set_features_misc();
++	set_features_debug();
++#ifdef USE_AUTO_KEY
++	__USE_AUTO_KEY = true;
++#endif
++}
+diff --git a/sdl/osd_web.cpp b/sdl/osd_web.cpp
+new file mode 100644
+index 0000000..4231074
+--- /dev/null
++++ b/sdl/osd_web.cpp
+@@ -0,0 +1,223 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++   Copyright (C) 2026 ZeR0-3
++   This file is part of the MZ-2800 Web Emulator, free software under the GNU GPL version 2 (see LICENSE). */
++/*
++	Web (Emscripten) port of CSP — OSD implementation.
++	GPL, same as Common Source Code Project.
++*/
++#include "../emu.h"
++#include "../fifo.h"
++#include "osd.h"
++#include <limits>
++
++OSD_BASE::OSD_BASE()
++{
++	vm = NULL;
++	__USE_AUTO_KEY = false;
++	now_auto_key = false;
++	host_cpus = 1;
++	main_window_handle = instance_handle = p_glv = NULL;
++	vm_screen_width = vm_screen_height = 0;
++	vm_window_width = vm_window_height = vm_window_width_aspect = vm_window_height_aspect = 0;
++	now_record_video = now_record_sound = false;
++	vm_screen_dirty = false;
++	sound_rate = 48000; sound_samples = 1024; sound_out_frames = 0; sound_muted = false;
++	screen_skip_line = false;
++	mouse_enabled = false;
++	memset(key_status, 0, sizeof(key_status));
++	memset(key_keep, 0, sizeof(key_keep));
++	memset(joy_status, 0, sizeof(joy_status));
++	memset(mouse_status, 0, sizeof(mouse_status));
++	memset(mouse_acc, 0, sizeof(mouse_acc));
++	set_features();
++	set_vm_screen_size(SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH, SCREEN_HEIGHT, SCREEN_WIDTH, WINDOW_HEIGHT_ASPECT);
++}
++
++// ---------------------------------------------------------------- features
++void OSD_BASE::add_feature(const _TCHAR *key, double value)
++{
++	feat_t f = {0, value, 0, 0}; features[key] = f;
++}
++void OSD_BASE::add_feature(const _TCHAR *key, int64_t value)
++{
++	feat_t f = {1, 0, value, 0}; features[key] = f;
++}
++void OSD_BASE::add_feature(const _TCHAR *key, uint64_t value)
++{
++	feat_t f = {2, 0, 0, value}; features[key] = f;
++}
++bool OSD_BASE::check_feature(const _TCHAR *key)
++{
++	return features.find(key) != features.end();
++}
++double OSD_BASE::get_feature_double_value(const _TCHAR *key)
++{
++	std::map<std::string, feat_t>::iterator it = features.find(key);
++	if(it == features.end()) return std::numeric_limits<double>::quiet_NaN();
++	return it->second.f;
++}
++int64_t OSD_BASE::get_feature_int64_value(const _TCHAR *key)
++{
++	std::map<std::string, feat_t>::iterator it = features.find(key);
++	return (it == features.end()) ? 0 : it->second.i;
++}
++uint64_t OSD_BASE::get_feature_uint64_value(const _TCHAR *key)
++{
++	std::map<std::string, feat_t>::iterator it = features.find(key);
++	return (it == features.end()) ? 0 : it->second.u;
++}
++
++#include "osd_features.inc"
++
++// ---------------------------------------------------------------- life cycle
++void OSD_BASE::initialize(int rate, int samples, int *presented_rate, int *presented_samples)
++{
++	// The VM is driven in small chunks so JS can pace it against the audio clock.
++	sound_rate = rate;
++	sound_samples = 1024;
++	*presented_rate = sound_rate;
++	*presented_samples = sound_samples;
++	sound_out.assign(sound_samples * 2, 0);
++	sound_out_frames = 0;
++}
++
++void OSD_BASE::release()
++{
++}
++
++void OSD_BASE::initialize_sound(int rate, int samples, int *presented_rate, int *presented_samples)
++{
++	initialize(rate, samples, presented_rate, presented_samples);
++}
++
++// ---------------------------------------------------------------- screen
++void OSD_BASE::set_vm_screen_size(int screen_width, int screen_height, int window_width, int window_height, int window_width_aspect, int window_height_aspect)
++{
++	if(window_width == -1) window_width = screen_width;
++	if(window_height == -1) window_height = screen_height;
++	if(window_width_aspect == -1) window_width_aspect = window_width;
++	if(window_height_aspect == -1) window_height_aspect = window_height;
++	if(vm_screen_width != screen_width || vm_screen_height != screen_height) {
++		vm_screen_width = screen_width;
++		vm_screen_height = screen_height;
++		screen_pixels.assign((size_t)screen_width * screen_height, 0xff000000);
++	}
++	vm_window_width = window_width;
++	vm_window_height = window_height;
++	vm_window_width_aspect = window_width_aspect;
++	vm_window_height_aspect = window_height_aspect;
++}
++
++scrntype_t *OSD_BASE::get_vm_screen_buffer(int y)
++{
++	if(y < 0 || y >= vm_screen_height) y = 0;
++	return &screen_pixels[(size_t)y * vm_screen_width];
++}
++
++int OSD_BASE::draw_screen()
++{
++	if(vm != NULL) {
++		vm->draw_screen();
++	}
++	return 1;
++}
++
++// ---------------------------------------------------------------- sound
++void OSD_BASE::update_sound(int *extra_frames)
++{
++	*extra_frames = 0;
++	sound_out_frames = 0;
++	if(vm == NULL) return;
++	uint16_t *buf = vm->create_sound(extra_frames);
++	if(buf != NULL) {
++		if((int)sound_out.size() < sound_samples * 2) sound_out.assign(sound_samples * 2, 0);
++		if(sound_muted) {
++			memset(&sound_out[0], 0, sound_samples * 2 * sizeof(int16_t));
++		} else {
++			memcpy(&sound_out[0], buf, sound_samples * 2 * sizeof(int16_t));
++		}
++		sound_out_frames = sound_samples;
++	}
++}
++
++// ---------------------------------------------------------------- input
++void OSD_BASE::key_down_native(int code, bool repeat)
++{
++	if(code < 0 || code > 255 || vm == NULL) return;
++	bool keep_frames = false;
++	if(code == 0xf0) {
++		code = VK_CAPITAL; keep_frames = true;
++	} else if(code == 0xf1 || code == 0xf2) {
++		code = VK_KANA; keep_frames = true;
++	} else if(code == 0xf3 || code == 0xf4) {
++		code = VK_KANJI; keep_frames = true;
++	}
++	if(key_status[code] == 0 || keep_frames) {
++		repeat = false;
++	}
++	key_status[code] = keep_frames ? KEY_KEEP_FRAMES : 0x80;
++
++	uint8_t prev_shift = key_status[VK_SHIFT];
++	uint8_t prev_control = key_status[VK_CONTROL];
++	uint8_t prev_menu = key_status[VK_MENU];
++	key_status[VK_SHIFT] = key_status[VK_LSHIFT] | key_status[VK_RSHIFT];
++	key_status[VK_CONTROL] = key_status[VK_LCONTROL] | key_status[VK_RCONTROL];
++	key_status[VK_MENU] = key_status[VK_LMENU] | key_status[VK_RMENU];
++
++	if(code == VK_LSHIFT || code == VK_RSHIFT) {
++		if(prev_shift == 0 && key_status[VK_SHIFT] != 0) vm->key_down(VK_SHIFT, repeat);
++	} else if(code == VK_LCONTROL || code == VK_RCONTROL) {
++		if(prev_control == 0 && key_status[VK_CONTROL] != 0) vm->key_down(VK_CONTROL, repeat);
++	} else if(code == VK_LMENU || code == VK_RMENU) {
++		if(prev_menu == 0 && key_status[VK_MENU] != 0) vm->key_down(VK_MENU, repeat);
++	}
++	vm->key_down(code, repeat);
++}
++
++void OSD_BASE::key_up_native(int code)
++{
++	if(code < 0 || code > 255 || vm == NULL) return;
++	if(key_status[code] == 0) return;
++	if((key_status[code] &= 0x7f) != 0) return;
++	vm->key_up(code);
++
++	uint8_t prev_shift = key_status[VK_SHIFT];
++	uint8_t prev_control = key_status[VK_CONTROL];
++	uint8_t prev_menu = key_status[VK_MENU];
++	key_status[VK_SHIFT] = key_status[VK_LSHIFT] | key_status[VK_RSHIFT];
++	key_status[VK_CONTROL] = key_status[VK_LCONTROL] | key_status[VK_RCONTROL];
++	key_status[VK_MENU] = key_status[VK_LMENU] | key_status[VK_RMENU];
++
++	if(code == VK_LSHIFT || code == VK_RSHIFT) {
++		if(prev_shift != 0 && key_status[VK_SHIFT] == 0) vm->key_up(VK_SHIFT);
++	} else if(code == VK_LCONTROL || code == VK_RCONTROL) {
++		if(prev_control != 0 && key_status[VK_CONTROL] == 0) vm->key_up(VK_CONTROL);
++	} else if(code == VK_LMENU || code == VK_RMENU) {
++		if(prev_menu != 0 && key_status[VK_MENU] == 0) vm->key_up(VK_MENU);
++	}
++}
++
++void OSD_BASE::update_input()
++{
++	// mouse: the VM wants the movement since the previous frame
++	mouse_status[0] = mouse_acc[0];
++	mouse_status[1] = mouse_acc[1];
++	mouse_acc[0] = mouse_acc[1] = 0;
++	// keys pressed with a "keep frames" count (kana/caps/kanji toggles) release themselves
++	for(int i = 0; i < 256; i++) {
++		if(key_status[i] & 0x7f) {
++			key_status[i] = (key_status[i] & 0x80) | ((key_status[i] & 0x7f) - 1);
++			if(key_status[i] == 0 && vm != NULL) vm->key_up(i);
++		}
++	}
++}
++
++void OSD_BASE::key_lost_focus()
++{
++	for(int i = 0; i < 256; i++) {
++		if(key_status[i] & 0x80) {
++			key_status[i] &= 0x7f;
++			if(key_status[i] == 0 && vm != NULL) vm->key_up(i);
++		}
++	}
++}
+diff --git a/sdl/web_main.cpp b/sdl/web_main.cpp
+new file mode 100644
+index 0000000..424003a
+--- /dev/null
++++ b/sdl/web_main.cpp
+@@ -0,0 +1,147 @@
++/* SPDX-License-Identifier: GPL-2.0-only
++   Copyright (C) 2026 ZeR0-3
++   This file is part of the MZ-2800 Web Emulator, free software under the GNU GPL version 2 (see LICENSE). */
++/*
++	Web (Emscripten) port of CSP — JavaScript-facing API.
++	GPL, same as Common Source Code Project.
++
++	JS drives everything: it writes ROMs/disk images into the virtual file system,
++	calls web_init(), then calls web_step() paced against the audio clock and
++	web_draw() once per display frame.
++*/
++#include <emscripten.h>
++#include "../emu.h"
++#include "../fifo.h"
++#include "osd.h"
++#include "../vm/device.h"
++
++// global configuration used by the VM (declared extern in config.h)
++config_t config;
++
++// The interactive CPU debugger console is not part of the web build.
++#ifdef USE_DEBUGGER
++void EMU::initialize_debugger() {}
++void EMU::release_debugger() {}
++void EMU::open_debugger(int cpu_index) {}
++void EMU::close_debugger(int cpu_index) {}
++bool EMU::is_debugger_enabled(int cpu_index) { return false; }
++#endif
++
++static EMU *g_emu = NULL;
++static OSD_BASE *g_osd = NULL;
++static std::vector<uint8_t> g_rgba;
++
++extern "C" {
++
++// Returns 0 on success.
++EMSCRIPTEN_KEEPALIVE int web_init()
++{
++	if(g_emu != NULL) return 0;
++	initialize_config();
++	config.sound_frequency = 6;      // 48 kHz
++	config.sound_latency = 1;
++	for(int i = 0; i < 4; i++) {
++		config.sound_volume_l[i] = config.sound_volume_r[i] = 0;
++	}
++	g_emu = new EMU();
++	g_osd = g_emu->get_osd();
++	return 0;
++}
++
++EMSCRIPTEN_KEEPALIVE void web_reset()          { if(g_emu) g_emu->reset(); }
++EMSCRIPTEN_KEEPALIVE int  web_sound_rate()     { return g_osd ? g_osd->sound_rate : 48000; }
++EMSCRIPTEN_KEEPALIVE int  web_sound_chunk()    { return g_osd ? g_osd->sound_samples : 1024; }
++EMSCRIPTEN_KEEPALIVE double web_frame_rate()   { return (g_emu && g_emu->get_vm()) ? g_emu->get_vm()->get_frame_rate() : FRAMES_PER_SEC; }
++
++// Run the VM long enough to produce one chunk of audio. Returns the number of stereo sample frames.
++EMSCRIPTEN_KEEPALIVE int web_step()
++{
++	if(!g_emu) return 0;
++	g_emu->run();
++	return g_osd->sound_out_frames;
++}
++EMSCRIPTEN_KEEPALIVE const int16_t *web_audio_ptr() { return g_osd ? &g_osd->sound_out[0] : NULL; }
++
++// Render the VM screen into an RGBA buffer.
++EMSCRIPTEN_KEEPALIVE void web_draw()
++{
++	if(!g_emu) return;
++	g_emu->draw_screen();
++	int w = g_osd->vm_screen_width, h = g_osd->vm_screen_height;
++	g_rgba.resize((size_t)w * h * 4);
++	const uint32_t *src = (const uint32_t *)&g_osd->screen_pixels[0];
++	uint32_t *dst = (uint32_t *)&g_rgba[0];
++	for(int i = 0; i < w * h; i++) {
++		dst[i] = src[i] | 0xff000000;   // RGB_COLOR is already R,G,B byte order on little-endian
++	}
++}
++EMSCRIPTEN_KEEPALIVE const uint8_t *web_screen_ptr() { return g_rgba.empty() ? NULL : &g_rgba[0]; }
++EMSCRIPTEN_KEEPALIVE int web_screen_w()        { return g_osd ? g_osd->vm_screen_width : 0; }
++EMSCRIPTEN_KEEPALIVE int web_screen_h()        { return g_osd ? g_osd->vm_screen_height : 0; }
++EMSCRIPTEN_KEEPALIVE int web_aspect_w()        { return g_osd ? g_osd->vm_window_width_aspect : 0; }
++EMSCRIPTEN_KEEPALIVE int web_aspect_h()        { return g_osd ? g_osd->vm_window_height_aspect : 0; }
++
++// Windows virtual-key codes (left/right variants for Shift/Ctrl/Alt).
++EMSCRIPTEN_KEEPALIVE void web_key(int vk, int down, int repeat)
++{
++	if(!g_emu) return;
++	if(down) g_emu->key_down(vk, false, repeat != 0);
++	else     g_emu->key_up(vk, false);
++}
++EMSCRIPTEN_KEEPALIVE void web_key_release_all() { if(g_osd) g_osd->key_lost_focus(); }
++
++// Relative mouse movement and button mask (bit0 = left, bit1 = right).
++EMSCRIPTEN_KEEPALIVE void web_mouse(int dx, int dy, int buttons)
++{
++	if(!g_osd) return;
++	g_osd->mouse_acc[0] += dx;
++	g_osd->mouse_acc[1] += dy;
++	g_osd->mouse_status[2] = buttons;
++}
++
++// Typed text through the emulator's auto-key feature ("\n" = Enter).
++EMSCRIPTEN_KEEPALIVE void web_type_text(const char *text)
++{
++#ifdef USE_AUTO_KEY
++	if(!g_emu || !text) return;
++	g_emu->set_auto_key_list((char *)text, (int)strlen(text));
++	g_emu->start_auto_key();
++#endif
++}
++
++EMSCRIPTEN_KEEPALIVE int web_open_fd(int drv, const char *path)
++{
++	if(!g_emu) return -1;
++	g_emu->open_floppy_disk(drv, path, 0);
++	return 0;
++}
++EMSCRIPTEN_KEEPALIVE void web_close_fd(int drv)  { if(g_emu) g_emu->close_floppy_disk(drv); }
++// Write a floppy image back to its file without ejecting it (CSP normally does this only on eject).
++EMSCRIPTEN_KEEPALIVE void web_sync_fd(int drv)   { if(g_emu && g_emu->get_vm()) g_emu->get_vm()->sync_floppy_disk(drv); }
++EMSCRIPTEN_KEEPALIVE int web_open_hd(int drv, const char *path)
++{
++	if(!g_emu) return -1;
++	g_emu->open_hard_disk(drv, path);
++	return 0;
++}
++EMSCRIPTEN_KEEPALIVE void web_close_hd(int drv)  { if(g_emu) g_emu->close_hard_disk(drv); }
++EMSCRIPTEN_KEEPALIVE int web_fd_inserted(int drv){ return g_emu ? g_emu->is_floppy_disk_inserted(drv) : 0; }
++EMSCRIPTEN_KEEPALIVE int web_fd_accessed()       { return g_emu ? (int)g_emu->is_floppy_disk_accessed() : 0; }
++EMSCRIPTEN_KEEPALIVE int web_hd_accessed()       { return g_emu ? (int)g_emu->is_hard_disk_accessed() : 0; }
++
++// ROM presence check, so the page can tell the user what is missing.
++EMSCRIPTEN_KEEPALIVE int web_have_file(const char *path) { return FILEIO::IsFileExisting(path) ? 1 : 0; }
++
++// Debug helpers (also used by tests).
++EMSCRIPTEN_KEEPALIVE unsigned web_cpu_pc()        { return (g_emu && g_emu->get_vm() && g_emu->get_vm()->get_cpu(0)) ? g_emu->get_vm()->get_cpu(0)->get_pc() : 0; }
++EMSCRIPTEN_KEEPALIVE int web_read8(unsigned addr)  { return (g_emu && g_emu->get_vm()) ? g_emu->get_vm()->get_cpu(0)->read_debug_data8(addr) : -1; }
++
++EMSCRIPTEN_KEEPALIVE void web_out8(unsigned port, unsigned val) { if(g_emu && g_emu->get_vm()) g_emu->get_vm()->get_cpu(0)->write_debug_io8(port, val); }
++
++}  // extern "C"
++
++int main()
++{
++	// Everything is driven from JS; the runtime stays alive.
++	return 0;
++}
+diff --git a/vm/disk.cpp b/vm/disk.cpp
+index 8e276b8..9d2dcda 100644
+--- a/vm/disk.cpp
++++ b/vm/disk.cpp
+@@ -769,6 +769,156 @@ void DISK::open(const _TCHAR* file_path, int bank)
+ 	}
+ }
+ 
++#ifdef _USE_SDL
++// Web port: write the current image back to its file without ejecting (called periodically by the page).
++void DISK::write_image()
++{
++	buffer[0x1a] = write_protected ? 0x10 : 0; // mey be changed
++	
++	if(/*!write_protected &&*/ !(file_size.d == orig_file_size && get_crc32(buffer, file_size.d) == orig_crc32)) {
++		// write image
++		FILEIO* fio = new FILEIO();
++		int pre_size = 0, post_size = 0;
++		uint8_t *pre_buffer = NULL, *post_buffer = NULL;
++		
++		// is this d88 format ?
++		if(check_file_extension(dest_path, _T(".d88")) || check_file_extension(dest_path, _T(".d8e")) || 
++		   check_file_extension(dest_path, _T(".d77")) || check_file_extension(dest_path, _T(".1dd"))) {
++			if(fio->Fopen(dest_path, FILEIO_READ_BINARY)) {
++				fio->Fseek(0, FILEIO_SEEK_END);
++				uint32_t total_size = fio->Ftell(), offset = 0;
++				for(int i = 0; i < file_bank; i++) {
++					fio->Fseek(offset + 0x1c, SEEK_SET);
++					offset += fio->FgetUint32_LE();
++				}
++				if((pre_size = offset) > 0) {
++					pre_buffer = (uint8_t *)malloc(pre_size);
++					fio->Fseek(0, FILEIO_SEEK_SET);
++					fio->Fread(pre_buffer, pre_size, 1);
++				}
++				fio->Fseek(offset + 0x1c, SEEK_SET);
++				offset += fio->FgetUint32_LE();
++				if((post_size = total_size - offset) > 0) {
++					post_buffer = (uint8_t *)malloc(post_size);
++					fio->Fseek(offset, FILEIO_SEEK_SET);
++					fio->Fread(post_buffer, post_size, 1);
++				}
++				fio->Fclose();
++			}
++		}
++		
++		// is this solid image and was physical formatted ?
++		if(is_solid_image) {
++			bool formatted = false;
++			int tracks = 0;
++			int tmp_nsec = solid_nsec;
++			int tmp_size = solid_size;
++			bool tmp_mfm = solid_mfm;
++			
++			for(int trkside = 0; trkside < 164; trkside++) {
++				pair32_t offset;
++				offset.read_4bytes_le_from(buffer + 0x20 + trkside * 4);
++				
++				if(!IS_VALID_TRACK(offset.d)) {
++					continue;
++				}
++				if(solid_nside == 1 && (trkside & 1) == 1) {
++					formatted = true;
++				}
++				tracks++;
++				
++				uint8_t* t = buffer + offset.d;
++				pair32_t sector_num, data_size;
++				sector_num.read_2bytes_le_from(t + 4);
++				
++				if(sector_num.sd != tmp_nsec) {
++					formatted = true;
++				}
++				for(int i = 0; i < sector_num.sd; i++) {
++					data_size.read_2bytes_le_from(t + 14);
++					if(data_size.sd != tmp_size) {
++						formatted = true;
++					}
++					if(t[6] != (tmp_mfm ? 0 : 0x40)) {
++						formatted = true;
++					}
++					t += data_size.sd + 0x10;
++				}
++				if(solid_nsec2 != 0) {
++					tmp_nsec = solid_nsec2;
++					tmp_size = solid_size2;
++					tmp_mfm  = solid_mfm2;
++				}
++			}
++			if(tracks != (solid_ncyl * solid_nside)) {
++				formatted = true;
++			}
++			if(formatted) {
++				my_stprintf_s(dest_path, _MAX_PATH, _T("%s.D88"), orig_path);
++				is_solid_image = false;
++			}
++		}
++		
++		if((FILEIO::IsFileExisting(dest_path) && FILEIO::IsFileProtected(dest_path)) || !fio->Fopen(dest_path, FILEIO_WRITE_BINARY)) {
++			if(is_d8e_image) {
++				fio->Fopen(local_path(create_string(_T("temporary_saved_floppy_disk_#%d.D8E"), drive_num)), FILEIO_WRITE_BINARY);
++			} else {
++				fio->Fopen(local_path(create_string(_T("temporary_saved_floppy_disk_#%d.D88"), drive_num)), FILEIO_WRITE_BINARY);
++			}
++		}
++		if(fio->IsOpened()) {
++			if(pre_buffer) {
++				fio->Fwrite(pre_buffer, pre_size, 1);
++			}
++			if(is_solid_image) {
++				if(is_fdi_image) {
++					fio->Fwrite(fdi_header, 4096, 1);
++				}
++				for(int trkside = 0; trkside < 164; trkside++) {
++					pair32_t offset;
++					offset.read_4bytes_le_from(buffer + 0x20 + trkside * 4);
++					
++					if(!IS_VALID_TRACK(offset.d)) {
++						continue;
++					}
++					uint8_t* t = buffer + offset.d;
++					pair32_t sector_num, data_size;
++					sector_num.read_2bytes_le_from(t + 4);
++					
++					for(int i = 0; i < sector_num.sd; i++) {
++						data_size.read_2bytes_le_from(t + 14);
++						fio->Fwrite(t + 0x10, data_size.sd, 1);
++						t += data_size.sd + 0x10;
++					}
++				}
++			} else {
++				fio->Fwrite(buffer, file_size.d, 1);
++			}
++			if(post_buffer) {
++				fio->Fwrite(post_buffer, post_size, 1);
++			}
++			fio->Fclose();
++		}
++		if(pre_buffer) {
++			free(pre_buffer);
++		}
++		if(post_buffer) {
++			free(post_buffer);
++		}
++		delete fio;
++	}
++	orig_file_size = file_size.d;
++	orig_crc32 = get_crc32(buffer, file_size.d);
++}
++
++void DISK::sync_image()
++{
++	if(inserted && !trim_required) {
++		write_image();
++	}
++}
++#endif
++
+ void DISK::close()
+ {
+ 	// write disk image
+@@ -777,6 +927,9 @@ void DISK::close()
+ 			trim_buffer();
+ 			trim_required = false;
+ 		}
++#ifdef _USE_SDL
++		write_image();
++#else
+ 		buffer[0x1a] = write_protected ? 0x10 : 0; // mey be changed
+ 		
+ 		if(/*!write_protected &&*/ !(file_size.d == orig_file_size && get_crc32(buffer, file_size.d) == orig_crc32)) {
+@@ -911,6 +1064,7 @@ void DISK::close()
+ 			}
+ 			delete fio;
+ 		}
++#endif
+ 		ejected = true;
+ 	}
+ 	inserted = write_protected = false;
+diff --git a/vm/disk.h b/vm/disk.h
+index cee3545..58d4d0a 100644
+--- a/vm/disk.h
++++ b/vm/disk.h
+@@ -176,6 +176,10 @@ public:
+ 	
+ 	void open(const _TCHAR* file_path, int bank);
+ 	void close();
++#ifdef _USE_SDL
++	void write_image();
++	void sync_image();
++#endif
+ //#ifdef _ANY2D88
+ 	bool is_d8e()
+ 	{
+diff --git a/vm/harddisk.cpp b/vm/harddisk.cpp
+index 5e56f81..3357d7a 100644
+--- a/vm/harddisk.cpp
++++ b/vm/harddisk.cpp
+@@ -203,7 +203,11 @@ bool HARDDISK::write_buffer(long position, int length, uint8_t *buffer)
+ 	if(mounted()) {
+ 		if(fio->Fseek(header_size + position, FILEIO_SEEK_SET) == 0) {
+ 			access = true;
+-			return (fio->Fwrite(buffer, length, 1) == 1);
++			bool ok = (fio->Fwrite(buffer, length, 1) == 1);
++#ifdef _USE_SDL
++			fio->Fflush();	// web port: keep the image file current so the page can read it back at any time
++#endif
++			return ok;
+ 		}
+ 	}
+ 	return false;
+diff --git a/vm/mz2800/mz2800.cpp b/vm/mz2800/mz2800.cpp
+index 4d46a73..589f566 100644
+--- a/vm/mz2800/mz2800.cpp
++++ b/vm/mz2800/mz2800.cpp
+@@ -393,6 +393,16 @@ void VM::set_sound_device_volume(int ch, int decibel_l, int decibel_r)
+ // user interface
+ // ----------------------------------------------------------------------------
+ 
++#ifdef _USE_SDL
++void VM::sync_floppy_disk(int drv)
++{
++	if(drv < USE_FLOPPY_DISK) {
++		DISK* d = fdc->get_disk_handler(drv);
++		if(d != NULL) d->sync_image();
++	}
++}
++#endif
++
+ void VM::open_floppy_disk(int drv, const _TCHAR* file_path, int bank)
+ {
+ 	fdc->open_disk(drv, file_path, bank);
+diff --git a/vm/mz2800/mz2800.h b/vm/mz2800/mz2800.h
+index 9608572..6ccb1ba 100644
+--- a/vm/mz2800/mz2800.h
++++ b/vm/mz2800/mz2800.h
+@@ -161,6 +161,9 @@ public:
+ 
+ 	// user interface
+ 	void open_floppy_disk(int drv, const _TCHAR* file_path, int bank);
++#ifdef _USE_SDL
++	void sync_floppy_disk(int drv) override;
++#endif
+ 	void close_floppy_disk(int drv);
+ 	bool is_floppy_disk_inserted(int drv);
+ 	void is_floppy_disk_protected(int drv, bool value);
+diff --git a/vm/vm_template.h b/vm/vm_template.h
+index 5e25a6a..d2ccaf6 100644
+--- a/vm/vm_template.h
++++ b/vm/vm_template.h
+@@ -102,6 +102,9 @@ public:
+ 	virtual void save_binary(int drv, const _TCHAR *file_path);
+ 	
+ 	virtual void close_floppy_disk(int drv);
++#ifdef _USE_SDL
++	virtual void sync_floppy_disk(int drv) {}
++#endif
+ 	virtual void close_quick_disk(int drv);
+ 	virtual void close_hard_disk(int drv);
+ 	virtual void close_compact_disc(int drv);
