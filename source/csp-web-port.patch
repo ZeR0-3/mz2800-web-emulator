@@ -2023,10 +2023,9 @@ index 0000000..4231074
 +}
 diff --git a/sdl/web_main.cpp b/sdl/web_main.cpp
 new file mode 100644
-index 0000000..424003a
 --- /dev/null
 +++ b/sdl/web_main.cpp
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,403 @@
 +/* SPDX-License-Identifier: GPL-2.0-only
 +   Copyright (C) 2026 ZeR0-3
 +   This file is part of the MZ-2800 Web Emulator, free software under the GNU GPL version 2 (see LICENSE). */
@@ -2039,10 +2038,12 @@ index 0000000..424003a
 +	web_draw() once per display frame.
 +*/
 +#include <emscripten.h>
++#include <string.h>
 +#include "../emu.h"
 +#include "../fifo.h"
 +#include "osd.h"
 +#include "../vm/device.h"
++#include "../vm/debugger.h"
 +
 +// global configuration used by the VM (declared extern in config.h)
 +config_t config;
@@ -2059,6 +2060,56 @@ index 0000000..424003a
 +static EMU *g_emu = NULL;
 +static OSD_BASE *g_osd = NULL;
 +static std::vector<uint8_t> g_rgba;
++
++
++// ---- debugger support (used by the i286 core through web_dbg_suspend_hook) ----
++// The CSP debugger blocks the CPU thread while it waits for commands.  With a single thread that is not
++// possible, so the core calls web_dbg_suspend_hook() instead: the CPU is "frozen" (it only burns cycles)
++// until JS resumes it with web_dbg_resume() / web_dbg_step().
++int web_dbg_frozen = 0;
++static int g_dbg_go_after_step = 0;
++static DEBUGGER *dbg_of_cpu()
++{
++	if(!g_emu || !g_emu->get_vm() || !g_emu->get_vm()->get_cpu(0)) return NULL;
++	DEBUGGER *d = (DEBUGGER *)g_emu->get_vm()->get_cpu(0)->get_debugger();
++	if(d) d->stop_on_exception = false;   // do not stop on CPU exceptions/traps unless asked
++	return d;
++}
++static void dbg_clear_hits(DEBUGGER *d)
++{
++	d->bp.hit = d->rbp.hit = d->wbp.hit = d->ibp.hit = d->obp.hit = false;
++}
++int web_dbg_suspend_hook(DEBUGGER *d)
++{
++	if(g_dbg_go_after_step) {      // first instruction after "continue" from a breakpoint: carry on
++		g_dbg_go_after_step = 0;
++		d->now_suspended = false;
++		dbg_clear_hits(d);
++		d->now_going = true;
++		return 0;
++	}
++	web_dbg_frozen = 1;
++	return 1;
++}
++static break_point_t *dbg_table(DEBUGGER *d, int kind)
++{
++	switch(kind) {
++	case 0: return &d->bp;
++	case 1: return &d->rbp;
++	case 2: return &d->wbp;
++	case 3: return &d->ibp;
++	case 4: return &d->obp;
++	}
++	return NULL;
++}
++static bool dbg_any(DEBUGGER *d)
++{
++	for(int k = 0; k < 5; k++) {
++		break_point_t *t = dbg_table(d, k);
++		for(int i = 0; i < MAX_BREAK_POINTS; i++) if(t->table[i].status == 1) return true;
++	}
++	return false;
++}
 +
 +extern "C" {
 +
@@ -2162,10 +2213,214 @@ index 0000000..424003a
 +EMSCRIPTEN_KEEPALIVE int web_have_file(const char *path) { return FILEIO::IsFileExisting(path) ? 1 : 0; }
 +
 +// Debug helpers (also used by tests).
-+EMSCRIPTEN_KEEPALIVE unsigned web_cpu_pc()        { return (g_emu && g_emu->get_vm() && g_emu->get_vm()->get_cpu(0)) ? g_emu->get_vm()->get_cpu(0)->get_pc() : 0; }
++EMSCRIPTEN_KEEPALIVE unsigned web_cpu_pc()        { return (g_emu && g_emu->get_vm() && g_emu->get_vm()->get_cpu(0)) ? g_emu->get_vm()->get_cpu(0)->get_next_pc() : 0; }
 +EMSCRIPTEN_KEEPALIVE int web_read8(unsigned addr)  { return (g_emu && g_emu->get_vm()) ? g_emu->get_vm()->get_cpu(0)->read_debug_data8(addr) : -1; }
 +
 +EMSCRIPTEN_KEEPALIVE void web_out8(unsigned port, unsigned val) { if(g_emu && g_emu->get_vm()) g_emu->get_vm()->get_cpu(0)->write_debug_io8(port, val); }
++
++EMSCRIPTEN_KEEPALIVE int web_auto_key_running()
++{
++#ifdef USE_AUTO_KEY
++	return g_emu ? (int)g_emu->is_auto_key_running() : 0;
++#else
++	return 0;
++#endif
++}
++// --- Introspection API (used by the Node MCP server, mcp/server.js) ---
++EMSCRIPTEN_KEEPALIVE void web_write8(unsigned addr, unsigned val)
++{
++	if(g_emu && g_emu->get_vm()) g_emu->get_vm()->get_cpu(0)->write_debug_data8(addr, val);
++}
++EMSCRIPTEN_KEEPALIVE int web_read_io8(unsigned port)
++{
++	return (g_emu && g_emu->get_vm()) ? (int)g_emu->get_vm()->get_cpu(0)->read_debug_io8(port) : -1;
++}
++// CPU registers as text (same text as the CSP debugger's "r" command). Returns the length.
++EMSCRIPTEN_KEEPALIVE int web_regs(char *buf, int len)
++{
++	if(!g_emu || !g_emu->get_vm() || len <= 0) return 0;
++	buf[0] = 0;
++	g_emu->get_vm()->get_cpu(0)->get_debug_regs_info(buf, len);
++	return (int)strlen(buf);
++}
++// Disassemble one instruction at linear address pc. Returns its length in bytes (text in buf).
++EMSCRIPTEN_KEEPALIVE int web_disasm(unsigned pc, char *buf, int len)
++{
++	if(!g_emu || !g_emu->get_vm() || len <= 0) return 0;
++	buf[0] = 0;
++	return g_emu->get_vm()->get_cpu(0)->debug_dasm(pc, buf, len);
++}
++// Save / load the whole machine state to a file in the virtual FS. Call between web_step()s.
++EMSCRIPTEN_KEEPALIVE int web_save_state(const char *path)
++{
++#ifdef USE_STATE
++	if(!g_emu) return -1;
++	g_emu->save_state(path);
++	return 0;
++#else
++	return -2;
++#endif
++}
++EMSCRIPTEN_KEEPALIVE int web_load_state(const char *path)
++{
++#ifdef USE_STATE
++	if(!g_emu) return -1;
++	g_emu->load_state(path);
++	g_osd = g_emu->get_osd();
++	return 0;
++#else
++	return -2;
++#endif
++}
++
++// --- Debugger API (Node MCP server): breakpoints, watchpoints, stepping, history ---
++// kind: 0 = execute, 1 = memory read, 2 = memory write, 3 = I/O in, 4 = I/O out.  Returns slots used (0 = table full).
++EMSCRIPTEN_KEEPALIVE int web_dbg_add(int kind, unsigned addr, int len)
++{
++	DEBUGGER *d = dbg_of_cpu(); break_point_t *t = d ? dbg_table(d, kind) : NULL;
++	if(!t) return 0;
++	if(len < 1) len = 1;
++	if(kind == 0 || kind >= 3) len = 1;
++	int used = 0;
++	for(int n = 0; n < len; n++) {
++		bool have = false;
++		for(int i = 0; i < MAX_BREAK_POINTS; i++) if(t->table[i].status == 1 && t->table[i].addr == addr + n) have = true;
++		if(have) { used++; continue; }
++		for(int i = 0; i < MAX_BREAK_POINTS; i++) {
++			if(t->table[i].status != 1) {
++				t->table[i].addr = addr + n; t->table[i].mask = 0xffffffff; t->table[i].status = 1; t->table[i].check_point = false;
++				used++; break;
++			}
++		}
++	}
++	if(used) {
++		d->now_debugging = true;
++		if(!web_dbg_frozen && !d->now_suspended) d->now_going = true;   // keep running; only stop at the break
++	}
++	return used;
++}
++// Remove entries at addr (len slots); returns how many were removed.
++EMSCRIPTEN_KEEPALIVE int web_dbg_del(int kind, unsigned addr, int len)
++{
++	DEBUGGER *d = dbg_of_cpu(); break_point_t *t = d ? dbg_table(d, kind) : NULL;
++	if(!t) return 0;
++	if(len < 1) len = 1;
++	int n = 0;
++	for(int i = 0; i < MAX_BREAK_POINTS; i++) {
++		if(t->table[i].status == 1 && t->table[i].addr >= addr && t->table[i].addr < addr + len) { t->table[i].status = 0; n++; }
++	}
++	if(!web_dbg_frozen && !dbg_any(d)) d->now_debugging = false;
++	return n;
++}
++EMSCRIPTEN_KEEPALIVE void web_dbg_clear()
++{
++	DEBUGGER *d = dbg_of_cpu(); if(!d) return;
++	for(int k = 0; k < 5; k++) {
++		break_point_t *t = dbg_table(d, k);
++		for(int i = 0; i < MAX_BREAK_POINTS; i++) t->table[i].status = 0;
++	}
++	if(!web_dbg_frozen) d->now_debugging = false;
++}
++// "kind addr" lines.
++EMSCRIPTEN_KEEPALIVE int web_dbg_list(char *buf, int len)
++{
++	DEBUGGER *d = dbg_of_cpu(); if(!d || len <= 0) return 0;
++	std::string out;
++	char tmp[48];
++	for(int k = 0; k < 5; k++) {
++		break_point_t *t = dbg_table(d, k);
++		for(int i = 0; i < MAX_BREAK_POINTS; i++) {
++			if(t->table[i].status == 1) { snprintf(tmp, sizeof(tmp), "%d %X\n", k, t->table[i].addr); out += tmp; }
++		}
++	}
++	snprintf(buf, len, "%s", out.c_str());
++	return (int)strlen(buf);
++}
++EMSCRIPTEN_KEEPALIVE int web_dbg_is_frozen() { return web_dbg_frozen; }
++// Why did the CPU stop?  "kind addr" (kind as in web_dbg_add, 5 = stepped / halted by request, -1 = not stopped).
++EMSCRIPTEN_KEEPALIVE int web_dbg_reason(char *buf, int len)
++{
++	DEBUGGER *d = dbg_of_cpu();
++	buf[0] = 0;
++	if(!d || !web_dbg_frozen) { snprintf(buf, len, "-1 0"); return -1; }
++	for(int k = 0; k < 5; k++) {
++		break_point_t *t = dbg_table(d, k);
++		if(t->hit) { snprintf(buf, len, "%d %X", k, t->hit_addr); return k; }
++	}
++	snprintf(buf, len, "5 0");
++	return 5;
++}
++// Stop the CPU at the next instruction boundary (like pressing "break").
++EMSCRIPTEN_KEEPALIVE void web_dbg_halt()
++{
++	DEBUGGER *d = dbg_of_cpu(); if(!d) return;
++	d->now_debugging = true;
++	d->now_going = false;
++	d->now_suspended = true;
++}
++static bool dbg_bp_at_pc(DEBUGGER *d, unsigned pc)
++{
++	for(int i = 0; i < MAX_BREAK_POINTS; i++) if(d->bp.table[i].status == 1 && d->bp.table[i].addr == pc) return true;
++	return false;
++}
++// Execute exactly one instruction while stopped (devices do not advance). Returns 0 on success.
++EMSCRIPTEN_KEEPALIVE int web_dbg_step()
++{
++	DEBUGGER *d = dbg_of_cpu();
++	if(!d) return -1;
++	DEVICE *cpu = g_emu->get_vm()->get_cpu(0);
++	dbg_clear_hits(d);
++	d->now_debugging = true;
++	d->now_going = false;
++	d->now_suspended = false;
++	g_dbg_go_after_step = 0;
++	web_dbg_frozen = 0;
++	// a breakpoint at the instruction we are about to execute must not stop us again
++	unsigned npc = cpu->get_next_pc();
++	bool off[MAX_BREAK_POINTS];
++	for(int i = 0; i < MAX_BREAK_POINTS; i++) {
++		off[i] = (d->bp.table[i].status == 1 && d->bp.table[i].addr == npc);
++		if(off[i]) d->bp.table[i].status = 2;
++	}
++	cpu->run(1);
++	for(int i = 0; i < MAX_BREAK_POINTS; i++) if(off[i]) d->bp.table[i].status = 1;
++	web_dbg_frozen = 1;                 // the instruction is done; keep the CPU stopped
++	d->now_suspended = true;
++	return 0;
++}
++// Let the CPU run until a breakpoint / watchpoint hits (then web_dbg_is_frozen() becomes 1).
++EMSCRIPTEN_KEEPALIVE int web_dbg_resume()
++{
++	DEBUGGER *d = dbg_of_cpu();
++	if(!d) return -1;
++	DEVICE *cpu = g_emu->get_vm()->get_cpu(0);
++	bool was_frozen = web_dbg_frozen != 0;
++	if(was_frozen && dbg_bp_at_pc(d, cpu->get_next_pc())) {
++		web_dbg_step();                 // step off the breakpoint we are sitting on
++		DEBUGGER *dd = d;
++		bool hit = dd->bp.hit || dd->rbp.hit || dd->wbp.hit || dd->ibp.hit || dd->obp.hit;
++		if(hit) return 0;               // the step itself tripped a watchpoint
++	}
++	dbg_clear_hits(d);
++	d->now_going = true;
++	d->now_suspended = false;
++	web_dbg_frozen = 0;
++	if(!dbg_any(d)) d->now_debugging = false;
++	return 0;
++}
++// Last n executed instruction addresses (newest first), written as 32-bit values; returns the count.
++EMSCRIPTEN_KEEPALIVE int web_dbg_history(uint32_t *out, int n)
++{
++	DEBUGGER *d = dbg_of_cpu(); if(!d) return 0;
++	int cnt = 0;
++	for(int i = 0; i < n; i++) {
++		uint32_t v = d->cpu_trace[(d->cpu_trace_ptr - 1 - i) & (MAX_CPU_TRACE - 1)];
++		if(v == 0xffffffff) break;
++		out[cnt++] = v;
++	}
++	return cnt;
++}
++EMSCRIPTEN_KEEPALIVE int web_dbg_available() { return dbg_of_cpu() != NULL; }
 +
 +}  // extern "C"
 +
@@ -2434,3 +2689,71 @@ index 5e25a6a..d2ccaf6 100644
  	virtual void close_quick_disk(int drv);
  	virtual void close_hard_disk(int drv);
  	virtual void close_compact_disc(int drv);
+diff --git a/vm/mame/emu/cpu/i86/i286.c b/vm/mame/emu/cpu/i86/i286.c
+--- a/vm/mame/emu/cpu/i86/i286.c
++++ b/vm/mame/emu/cpu/i86/i286.c
+@@ -357,9 +357,15 @@
+ 	cpustate->memory_wait = 0;
+ }
+ 
++#ifdef _USE_SDL
++extern int web_dbg_frozen;
++extern int web_dbg_suspend_hook(DEBUGGER *d);
++#else
++#define web_dbg_frozen 0
++#endif
+ static CPU_EXECUTE( i80286 )
+ {
+-	if (cpustate->halted || cpustate->busreq || cpustate->haltreq)
++	if (cpustate->halted || cpustate->busreq || cpustate->haltreq || web_dbg_frozen)
+ 	{
+ //#ifdef SINGLE_MODE_DMA
+ 		if(!cpustate->haltreq) {
+@@ -369,12 +375,16 @@
+ 		}
+ //#endif
+ 		bool now_debugging = false;
+-		if(cpustate->debugger != NULL) {
++		if(cpustate->debugger != NULL && !web_dbg_frozen) {
+ 			now_debugging = cpustate->debugger->now_debugging;
+ 		}
+ 		if(now_debugging) {
+ 			cpustate->debugger->check_break_points(cpustate->pc);
+ 			if(cpustate->debugger->now_suspended) {
++#ifdef _USE_SDL
++				// web port: nothing can block here (single thread); the host (JS) resumes the CPU explicitly
++				web_dbg_suspend_hook(cpustate->debugger);
++#else
+ 				cpustate->debugger->now_waiting = true;
+ 				cpustate->emu->start_waiting_in_debugger();
+ 				while(cpustate->debugger->now_debugging && cpustate->debugger->now_suspended) {
+@@ -382,6 +392,7 @@
+ 				}
+ 				cpustate->emu->finish_waiting_in_debugger();
+ 				cpustate->debugger->now_waiting = false;
++#endif
+ 			}
+ 			if(cpustate->debugger->now_debugging) {
+ 				cpustate->program = cpustate->io = cpustate->debugger;
+@@ -457,6 +468,13 @@
+ 		if(now_debugging) {
+ 			cpustate->debugger->check_break_points(cpustate->pc);
+ 			if(cpustate->debugger->now_suspended) {
++#ifdef _USE_SDL
++				// web port: stop this time slice here and keep the CPU frozen until the host resumes it
++				if(web_dbg_suspend_hook(cpustate->debugger)) {
++					cpustate->icount = 0;
++					break;
++				}
++#else
+ 				cpustate->debugger->now_waiting = true;
+ 				cpustate->emu->start_waiting_in_debugger();
+ 				while(cpustate->debugger->now_debugging && cpustate->debugger->now_suspended) {
+@@ -464,6 +482,7 @@
+ 				}
+ 				cpustate->emu->finish_waiting_in_debugger();
+ 				cpustate->debugger->now_waiting = false;
++#endif
+ 			}
+ 			if(cpustate->debugger->now_debugging) {
+ 				cpustate->program = cpustate->io = cpustate->debugger;

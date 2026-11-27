@@ -41,6 +41,10 @@
   input[type=file] { display:none; }
   input[type=text] { background:#12151a; color:var(--fg); border:1px solid #3a404b; border-radius:5px; padding:5px 8px; font:inherit; width:100%; }
   input[type=range] { width:100%; }
+  #dbgState { font-size:12px; margin:4px 0; } #dbgState.stopped { color:#ffb454; font-weight:600; }
+  #dbgBox pre { margin:4px 0; padding:6px 8px; background:#0c0e12; border:1px solid #2a2f38; border-radius:5px; font:11px/1.35 ui-monospace,Menlo,Consolas,monospace; overflow-x:auto; max-height:200px; white-space:pre; }
+  #dbgBox select, #dbgBox input[type=text] { background:#12151a; color:var(--fg); border:1px solid #3a404b; border-radius:5px; padding:4px 6px; font:inherit; min-width:0; }
+  #dbgBox .bp { font-size:12px; font-family:ui-monospace,Menlo,Consolas,monospace; } #dbgBox .bp button { padding:0 6px; }
   .btns { display:flex; gap:6px; flex-wrap:wrap; }
   small { color:var(--dim); }
   #drop { border:1px dashed #3a404b; border-radius:6px; padding:10px; text-align:center; color:var(--dim); font-size:12px; }
@@ -136,12 +140,36 @@
     </section>
 
     <section>
+      <h2>デバッガ</h2>
+      <details id="dbgBox">
+        <summary>ブレークポイント / ステップ実行</summary>
+        <div id="dbgState">実行中</div>
+        <div class="btns">
+          <button id="dbgBreak">中断</button><button id="dbgCont" disabled>続行</button><button id="dbgStep" disabled>ステップ</button><button id="dbgOver" disabled>ステップオーバー</button>
+        </div>
+        <pre id="dbgRegs"></pre><pre id="dbgDis"></pre>
+        <div class="row">
+          <select id="dbgType"><option value="0">実行</option><option value="1">メモリ読み</option><option value="2">メモリ書き</option><option value="3">I/O入力</option><option value="4">I/O出力</option></select>
+          <input type="text" id="dbgAddr" placeholder="70000 / 7000:0" style="flex:1" autocomplete="off">
+          <input type="text" id="dbgLen" value="1" size="2" title="監視バイト数(1-16)" autocomplete="off">
+          <button id="dbgAddBp">追加</button>
+        </div>
+        <div id="dbgBps"></div>
+        <div class="btns" style="margin-top:6px"><button id="dbgClearAll">全部削除して続行</button><button id="dbgHistBtn">実行履歴</button></div>
+        <pre id="dbgHist"></pre>
+        <div class="row"><input type="text" id="dbgMemAddr" placeholder="メモリ表示アドレス" style="flex:1" autocomplete="off"><button id="dbgMemBtn">表示</button></div>
+        <pre id="dbgMem"></pre>
+        <small>アドレスは16進(<code>70000</code>, <code>F000:FFF0</code>)。ブレーク中は画面と時間が止まります。ウォッチは命令の完了後に止まり、表示されるのは次の命令です。</small>
+      </details>
+    </section>
+
+    <section>
       <div id="drop">ここにファイルをドロップ(ROM・ディスクイメージを自動判別)</div>
     </section>
   </aside>
 </main>
 <footer>
-  GPL-2.0-or-later。ソース・パッチ・ビルド手順は同梱の README を参照。ROM と、ROMを逆アセンブルした内容は同梱・再配布されていません。
+  GPL-2.0-only。ソース・パッチ・ビルド手順は同梱の README を参照。ROM と、ROMを逆アセンブルした内容は同梱・再配布されていません。
 </footer>
 <script src="csp2800.js"></script>
 <script src="app.js"></script>

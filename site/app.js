@@ -4,7 +4,7 @@
 /*
   MZ-2800 Web Emulator front-end.
   Drives the WebAssembly build of the Common Source Code Project MZ-2800 VM.
-  GPL-2.0-or-later.
+  GPL-2.0-only.
 */
 'use strict';
 
@@ -453,8 +453,123 @@ function clockNow() {
   return { t: performance.now() / 1000, kind: 'wall' };
 }
 
+
+// ------------------------------------------------------------------ debugger (breakpoints / stepping)
+const dbg = {
+  frozen: false, active: false, temp: null, last: '',
+  TYPES: ['実行', 'メモリ読み', 'メモリ書き', 'I/O入力', 'I/O出力'],
+  withBuf(n, fn) { const M = state.M, p = M._malloc(n); try { return fn(p); } finally { M._free(p); } },
+  cstr(p) { const h = state.M.HEAPU8; let e = p; while (h[e]) e++; return new TextDecoder().decode(h.subarray(p, e)); },
+  hex(v, w) { return v.toString(16).toUpperCase().padStart(w || 0, '0'); },
+  list() { return this.withBuf(2048, (p) => { state.api.dbgList(p, 2048); return this.cstr(p); }).split('\n').filter(Boolean).map((l) => { const [k, a, n] = l.split(' '); return { kind: +k, addr: parseInt(a, 16), len: n ? +n : 1 }; }); },
+  reason() {
+    const t = this.withBuf(64, (p) => { state.api.dbgReason(p, 64); return this.cstr(p); }).split(' ');
+    const k = +t[0]; if (k < 0) return '';
+    if (k === 5) return '中断しました';
+    return this.TYPES[k] + 'ブレーク ' + this.hex(parseInt(t[1], 16), k >= 3 ? 4 : 6);
+  },
+  dasm(pc, count) {
+    const out = [];
+    this.withBuf(256, (p) => {
+      for (let i = 0; i < count; i++) {
+        let len = state.api.disasm(pc, p, 256); if (len <= 0) len = 1;
+        let b = ''; for (let j = 0; j < len && j < 8; j++) b += this.hex(state.api.read8((pc + j) & 0xffffff) & 255, 2);
+        out.push({ pc, len, mn: this.cstr(p), text: this.hex(pc, 6) + ': ' + b.padEnd(16) + ' ' + this.cstr(p) });
+        pc = (pc + len) & 0xffffff;
+      }
+    });
+    return out;
+  },
+  anyBp() { return this.list().length > 0; },
+  onStop() {              // the CPU just stopped (breakpoint, watchpoint, step or break)
+    this.frozen = true; this.active = true;
+    this.last = this.reason();
+    if (this.temp != null) { state.api.dbgDel(0, this.temp, 1); this.temp = null; }
+    this.render();
+  },
+  render() {
+    const box = $('dbgBox'); if (!box || !state.api) return;
+    const f = state.api.dbgFrozen();
+    this.frozen = !!f;
+    $('dbgState').textContent = f ? ('停止中' + (this.last ? ' — ' + this.last : '')) : '実行中';
+    $('dbgState').className = f ? 'stopped' : '';
+    for (const id of ['dbgCont', 'dbgStep', 'dbgOver']) $(id).disabled = !f;
+    $('dbgBreak').disabled = !!f;
+    if (f) {
+      this.withBuf(1024, (p) => { state.api.regs(p, 1024); $('dbgRegs').textContent = this.cstr(p).split('\n').slice(0, 2).join('\n'); });
+      $('dbgDis').textContent = this.dasm(state.api.pc(), 8).map((l, i) => (i ? '  ' : '> ') + l.text).join('\n');
+    } else { $('dbgRegs').textContent = ''; $('dbgDis').textContent = ''; }
+    const l = this.list();
+    $('dbgBps').innerHTML = '';
+    for (const b of l) {
+      const li = document.createElement('div'); li.className = 'bp';
+      li.textContent = this.TYPES[b.kind] + ' ' + this.hex(b.addr, b.kind >= 3 ? 4 : 6) + (b.len > 1 ? ' (' + b.len + 'B)' : '') + ' ';
+      const x = document.createElement('button'); x.textContent = '×'; x.title = '削除';
+      x.addEventListener('click', () => { state.api.dbgDel(b.kind, b.addr, b.len); this.afterEdit(); });
+      li.appendChild(x); $('dbgBps').appendChild(li);
+    }
+    if (!l.length) $('dbgBps').textContent = '(ブレークポイントなし)';
+  },
+  afterEdit() { this.active = this.anyBp() || this.frozen; this.render(); },
+  addBp() {
+    const t = +$('dbgType').value, a = parseAddr($('dbgAddr').value);
+    if (a == null) { $('dbgAddr').focus(); return; }
+    const n = state.api.dbgAdd(t, a, (t === 1 || t === 2) ? Math.min(16, Math.max(1, parseInt($('dbgLen').value, 10) || 1)) : 1);
+    if (!n) { alert('これ以上追加できません(各種類 16 個まで)'); return; }
+    this.active = true; this.render();
+  },
+  halt() { state.api.dbgHalt(); this.active = true; this.stepOnce(0); },
+  stepOnce(n) {           // run a little so a pending halt takes effect, then show the state
+    for (let i = 0; i < 4 && !state.api.dbgFrozen(); i++) state.api.step();
+    this.onStop();
+  },
+  resume() {
+    if (!this.frozen) return;
+    state.api.dbgResume();
+    this.frozen = !!state.api.dbgFrozen();     // stopped again immediately (a watch hit on the first instruction)
+    if (this.frozen) { this.last = this.reason(); }
+    else { this.last = ''; loop.anchor = 0; this.active = this.anyBp(); }
+    this.render();
+  },
+  step() {
+    if (!this.frozen) return;
+    state.api.dbgStep();
+    const r = this.reason(); this.last = (!r || r === '中断しました') ? '1命令実行' : r; this.render();
+  },
+  over() {
+    if (!this.frozen) return;
+    const [ins] = this.dasm(state.api.pc(), 1);
+    if (!/^(call|lcall|int|into|loop\w*|rep\w*)\b/i.test(ins.mn)) return this.step();
+    const target = (ins.pc + ins.len) & 0xffffff;
+    if (!this.list().some((b) => b.kind === 0 && b.addr === target)) { state.api.dbgAdd(0, target, 1); this.temp = target; }
+    this.resume();
+  },
+  history() {
+    const n = 40;
+    const a = this.withBuf(4 * n, (p) => { const c = state.api.dbgHist(p, n); return [...new Uint32Array(state.M.HEAPU8.buffer, p, c)]; }).reverse();
+    $('dbgHist').textContent = a.length ? a.map((pc) => this.dasm(pc, 1)[0].text).join('\n') : '(履歴なし)';
+  },
+  dump() {
+    const a = parseAddr($('dbgMemAddr').value); if (a == null) return;
+    let out = '';
+    for (let r = 0; r < 8; r++) {
+      let h = '', c = '';
+      for (let i = 0; i < 16; i++) { const v = state.api.read8((a + r * 16 + i) & 0xffffff) & 255; h += ' ' + this.hex(v, 2); c += v >= 32 && v < 127 ? String.fromCharCode(v) : '.'; }
+      out += this.hex((a + r * 16) & 0xffffff, 6) + ':' + h + '  ' + c + '\n';
+    }
+    $('dbgMem').textContent = out;
+  },
+};
+function parseAddr(v) {
+  let s = String(v || '').replace(/\s+/g, ''); if (!s) return null;
+  if (s.includes(':')) { const [a, b] = s.split(':'); if (!/^[0-9a-f]{1,4}$/i.test(a) || !/^[0-9a-f]{1,4}$/i.test(b)) return null; return parseInt(a, 16) * 16 + parseInt(b, 16); }
+  if (s[0] === '$') s = s.slice(1); else if (/^0x/i.test(s)) s = s.slice(2); else if (/h$/i.test(s)) s = s.slice(0, -1);
+  return /^[0-9a-f]{1,6}$/i.test(s) ? parseInt(s, 16) : null;
+}
+
 function tick() {
   if (!state.running || state.paused || !state.api) return;
+  if (dbg.frozen) return;
   const turbo = state.speed > 1;
   const c = turbo ? { t: performance.now() / 1000, kind: 'wall' } : clockNow();
   if (c.kind !== loop.clock || loop.anchor === 0 || loop.speed !== state.speed) {   // (re)anchor when the clock changes
@@ -468,6 +583,7 @@ function tick() {
   while (loop.emuT < target() && performance.now() < budgetEnd && n < 64) {
     const frames = state.api.step();
     loop.steps++;
+    if (dbg.active && state.api.dbgFrozen()) { dbg.onStop(); break; }
     if (pendingUps.length) flushUps(false);
     if (!turbo && loop.clock === 'audio' && frames > 0 && audio.ctx) scheduleAudio(frames, chunkDur);
     loop.emuT += chunkDur;
@@ -573,6 +689,10 @@ async function powerOn() {
       typeText: cw('web_type_text', null, ['string']),
       syncFd: cw('web_sync_fd', null, ['number']), openFd: cw('web_open_fd', 'number', ['number', 'string']), closeFd: cw('web_close_fd', null, ['number']),
       openHd: cw('web_open_hd', 'number', ['number', 'string']), closeHd: cw('web_close_hd', null, ['number']),
+      dbgAdd: cw('web_dbg_add', 'number', ['number', 'number', 'number']), dbgDel: cw('web_dbg_del', 'number', ['number', 'number', 'number']), dbgClear: cw('web_dbg_clear', null, []),
+      dbgList: cw('web_dbg_list', 'number', ['number', 'number']), dbgFrozen: cw('web_dbg_is_frozen', 'number', []), dbgReason: cw('web_dbg_reason', 'number', ['number', 'number']),
+      dbgHalt: cw('web_dbg_halt', null, []), dbgStep: cw('web_dbg_step', 'number', []), dbgResume: cw('web_dbg_resume', 'number', []), dbgHist: cw('web_dbg_history', 'number', ['number', 'number']),
+      pc: cw('web_cpu_pc', 'number', []), read8: cw('web_read8', 'number', ['number']), regs: cw('web_regs', 'number', ['number', 'number']), disasm: cw('web_disasm', 'number', ['number', 'number', 'number']),
       fdAccessed: cw('web_fd_accessed', 'number', []), hdAccessed: cw('web_hd_accessed', 'number', []),
     };
     if (state.M) { releaseAllKeys(); }
@@ -597,10 +717,25 @@ async function powerOn() {
 }
 
 // ------------------------------------------------------------------ wiring
+
+// debugger panel
+$('dbgBreak').addEventListener('click', () => { if (state.api) dbg.halt(); });
+$('dbgCont').addEventListener('click', () => dbg.resume());
+$('dbgStep').addEventListener('click', () => dbg.step());
+$('dbgOver').addEventListener('click', () => dbg.over());
+$('dbgAddBp').addEventListener('click', () => { if (state.api) dbg.addBp(); });
+$('dbgClearAll').addEventListener('click', () => { if (state.api) { state.api.dbgClear(); dbg.resume(); dbg.afterEdit(); } });
+$('dbgHistBtn').addEventListener('click', () => { if (state.api) dbg.history(); });
+$('dbgMemBtn').addEventListener('click', () => { if (state.api) dbg.dump(); });
+$('dbgAddr').addEventListener('keydown', (e) => { if (e.key === 'Enter' && state.api) dbg.addBp(); e.stopPropagation(); });
+$('dbgMemAddr').addEventListener('keydown', (e) => { if (e.key === 'Enter' && state.api) dbg.dump(); e.stopPropagation(); });
+$('dbgLen').addEventListener('keydown', (e) => e.stopPropagation());
 $('ovStart').addEventListener('click', powerOn);
 $('btnReset').addEventListener('click', () => {
   if (!state.running) { powerOn(); return; }
   state.api.reset();
+  if (dbg.frozen) { state.api.dbgResume(); dbg.last = ''; loop.anchor = 0; }
+  dbg.render();
 });
 $('btnPause').addEventListener('click', () => {
   if (!state.running) return;

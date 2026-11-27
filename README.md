@@ -8,6 +8,7 @@ CPU(80286)・FDC・SASI・CRTC・OPN・PCM などの挙動は CSP 本体と同�
 ## 中身
 
 ```
+mcp/                     MCP サーバー(Node.js, 依存なし)。デスクトップ版と同じツールでサーバー上のエミュレータを操作
 site/                    そのまま公開できる静的ファイル一式(ROMは含まない)
   pseudo-ipl.rom         内蔵の疑似IPL(IPL.ROM を選ばないときに使う。source/pseudo-ipl から作成)
   index.html app.js      画面・操作部
@@ -43,7 +44,7 @@ dist/                    サーバ不要の単一HTML(mz2800-standalone.html)
 
 ## 未対応・制限
 
-- プリンタ出力、ジョイスティック/ゲームパッド、ステートセーブ、CPU デバッガ、ネットワーク/MIDI は無効。
+- プリンタ出力、ジョイスティック/ゲームパッド、ステートセーブ、ネットワーク/MIDI は無効。CPU デバッガは右パネルの「デバッガ」(中断/続行/ステップ/ステップオーバー、実行・メモリ読み書き・I/O ブレークポイント、レジスタ・逆アセンブル・実行履歴・メモリダンプ)と、MCP(Node サーバー)から使えます。
 - 疑似IPLは FD / HDD ブートと FreeDOS 向けの最小限の機能だけです(漢字・カナ・グラフィック・実機BIOSの多くの機能は無し)。
 - ブラウザのタブが裏に回ると、タイマー制限で音が途切れます。
 - ×1 の速さは音声クロックに合わせています。端末が遅いと速度表示が 100% を下回ります。
@@ -96,6 +97,19 @@ source/build-web.sh /path/to/common_source_project-.../source/src
 # 3. 疑似IPL: python3 source/pseudo-ipl/build.py (nasm が必要)
 # 4. 単一HTML: python3 source/make-standalone.py site dist/mz2800-standalone.html
 ```
+
+## MCP(サーバーで動かす)
+
+`mcp/mz2800-mcp.js` は、このエミュレータ(WASM)を Node.js で動かし、MCP(stdio / HTTP)で操作するサーバーです。
+デスクトップ版(Qt)内蔵の MCP と同じツール名・引数・出力形式で、画面取得・キー入力・メモリ/レジスタ参照・逆アセンブル・ディスク差し替え・ステート保存に加え、**ブレークポイント/ウォッチポイント・ステップ実行・実行履歴のデバッガ**(`set_breakpoint` `continue` `step` `history` など)が使えます。
+Qt も画面も要らず、ROM が無くても疑似IPLで動きます。
+
+```
+node mcp/mz2800-mcp.js --port 8800 --token 合言葉 --fd0 /path/disk.d88
+claude mcp add --transport http mz2800-web http://127.0.0.1:8800/mcp --header "Authorization: Bearer 合言葉"
+```
+
+詳細・オプション・デスクトップ版との違い・安全面は `mcp/README.md`。
 
 ## ディスクの自動保存
 ディスクの書き込みは、既定でこのブラウザの IndexedDB に自動保存され(約4秒ごと・タブを閉じる時)、次回ページを開くと復元されます。チェックボックスで切り替えでき、「保存したディスクを消す」で破棄できます。HDD は書き込みのたびに、FD は4秒ごとのチェックでイメージへ書き戻して保存します(CSP は本来 FD を取り出すときにしか書き戻さないため、web 版では `web_sync_fd` で取り出さずに書き戻しています)。ブラウザのデータを消すと失われるので、大事なものは「FD0/HD0 を保存」でダウンロードしてください。
